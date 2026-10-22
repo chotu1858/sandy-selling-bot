@@ -1,0 +1,15 @@
+services:
+  bot-host:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      COOKIE_SECURE: "1"
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
