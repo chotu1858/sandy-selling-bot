@@ -1,1 +1,0 @@
-# sandy-selling-bot
