@@ -1,0 +1,2908 @@
+#!/usr/bin/env python3
+"""
+SANDY STORE - TELEGRAM BOT  (v5 - VIP store)
+
+v5: products are buttons right on the main page (no Store button); every product has its own VIP link,
+demo link, button titles, multiple photos/videos, demo photos/videos and plan durations (all editable
+from the admin panel). Welcome text + multiple welcome photos/videos, UPI ID, store name, support
+username, recharge limits and referral % are editable from the admin panel too.
+Leaderboard and total-revenue views were removed.
+
+v3: every message in bold, every button coloured + bold, maintenance mode,
+leaderboard, help/FAQ, custom welcome message, deduct balance, DB backup,
+admin logs, coupon/plan management, top products/buyers, banned list.
+
+What's new vs v1
+- Colourful buttons (Telegram Bot API 9.4 `style`: primary / success / danger)
+- Secrets moved to .env (no tokens inside the code)
+- Bug fixes: referral commission, wallet history, coupon discounts,
+  double-tap double-charge, deleted products coming back after restart,
+  wrong "today" sales (timezone), key refund + key delivered at same time
+- Ban / unban, user search, multiple admins
+- Duplicate UTR protection, auto-expire unfinished payments
+- Product edit (price), product on/off, delete confirmation
+- Sales report + CSV export
+- Flood protection, admin action log
+"""
+
+import os
+import io
+import re
+import sys
+import csv
+import json
+import html
+import time
+import random
+import string
+import sqlite3
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List
+from urllib.parse import quote
+
+import requests
+import qrcode
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    InputMediaPhoto, InputMediaVideo
+)
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ExtBot, Defaults
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION  (values come from .env)
+# ═══════════════════════════════════════════════════════════════════
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_env(path: str):
+    """Tiny .env loader (no extra package needed)."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_env(os.path.join(BASE_DIR, ".env"))
+
+# ┌──────────────────────────────────────────────────────────────┐
+# │  🔧 YAHAN APNI SETTINGS DALO  (ya .env file use karo)        │
+# └──────────────────────────────────────────────────────────────┘
+BOT_TOKEN_VALUE = ""                  # ← Telegram Bot Token (@BotFather se)
+ADMIN_ID_VALUE = "8037099066"         # ← Admin Telegram ID  (multiple: "111,222")
+FMPAY_API_KEY_VALUE = "fmpay_eecdb330d14f8aa8d735a0d5ec87c115d8963d1d"   # ← FMPay API key
+FMPAY_BASE_URL_VALUE = "https://famapi-sas5.onrender.com"            # ← FMPay API URL
+UPI_ID_VALUE = "harshai83@fam"        # ← Paisa receive karne wali UPI ID (dobara check karo!)
+# ────────────────────────────────────────────────────────────────
+
+BOT_TOKEN = BOT_TOKEN_VALUE.strip() or os.getenv("BOT_TOKEN", "").strip()
+_admin_raw = ADMIN_ID_VALUE.strip() or os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = {int(x) for x in _admin_raw.replace(" ", "").split(",") if x.isdigit()}
+FMPAY_API_KEY = FMPAY_API_KEY_VALUE.strip() or os.getenv("FMPAY_API_KEY", "").strip()
+FMPAY_BASE_URL = (FMPAY_BASE_URL_VALUE.strip() or os.getenv("FMPAY_BASE_URL", "")).rstrip("/")
+FMPAY_TIMEOUT = 60   # free Render servers can take ~50s to wake up
+UPI_ID = UPI_ID_VALUE.strip() or os.getenv("UPI_ID", "").strip()
+STORE_NAME = os.getenv("STORE_NAME", "SANDY_STORE01")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@SANDY_STORE01")
+
+API_URL = os.getenv("API_URL", "https://fflevel.in/api/external/panel/keygen")
+API_HEADERS = {
+    "X-API-Key": os.getenv("API_KEY", ""),
+    "M-Key": os.getenv("API_MKEY", ""),
+}
+
+MIN_RECHARGE = float(os.getenv("MIN_RECHARGE", "10"))
+MAX_RECHARGE = float(os.getenv("MAX_RECHARGE", "10000"))
+REFERRAL_PERCENT = float(os.getenv("REFERRAL_PERCENT", "2"))
+PAYMENT_EXPIRY_MIN = int(os.getenv("PAYMENT_EXPIRY_MIN", "30"))
+TZ_OFFSET_MIN = int(os.getenv("TZ_OFFSET_MIN", "330"))  # IST = +5:30
+
+DB_NAME = os.path.join(BASE_DIR, os.getenv("DB_NAME", "SHADMAN_store.db"))
+
+# defaults from the code/.env - values changed in the admin panel (stored in the DB) override these
+_DEFAULT_CFG = {
+    "UPI_ID": UPI_ID, "STORE_NAME": STORE_NAME, "SUPPORT_USERNAME": SUPPORT_USERNAME,
+    "MIN_RECHARGE": MIN_RECHARGE, "MAX_RECHARGE": MAX_RECHARGE, "REFERRAL_PERCENT": REFERRAL_PERCENT,
+}
+MAX_MEDIA_PER_ITEM = 20   # max photos+videos for the welcome screen / a product / a demo
+
+API_HOURS_MAP = {
+    "1 Hour": 1, "3 Hours": 3, "6 Hours": 6, "12 Hours": 12, "1 Day": 24,
+}
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FMPAY CLIENT  (UTR verification:  POST /verify  {utr, amount})
+# ═══════════════════════════════════════════════════════════════════
+
+class FmPayError(Exception):
+    pass
+
+
+def _to_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmpay_verify(utr: str, amount: float) -> Dict[str, Any]:
+    """Asks the gateway if a payment with this UTR and amount was received.
+    -> {'ok': bool, 'message': str, 'amount': float|None}.  Raises FmPayError on gateway problems."""
+    try:
+        resp = requests.post(
+            f"{FMPAY_BASE_URL}/verify",
+            json={"utr": utr, "amount": round(float(amount), 2), "api_key": FMPAY_API_KEY},
+            headers={"X-API-Key": FMPAY_API_KEY, "Content-Type": "application/json"},
+            timeout=FMPAY_TIMEOUT)
+    except requests.RequestException as e:
+        raise FmPayError(f"network error: {e}")
+    try:
+        j = resp.json()
+    except ValueError:
+        raise FmPayError(f"non-JSON reply (HTTP {resp.status_code})")
+    if not isinstance(j, dict):
+        raise FmPayError("unexpected reply")
+    logger.info(f"FMPay verify {utr}: HTTP {resp.status_code} {str(j)[:300]}")
+    msg = str(j.get("message") or j.get("error") or j.get("status") or "")
+    if resp.status_code in (401, 403) or resp.status_code >= 500:
+        raise FmPayError(msg or f"HTTP {resp.status_code}")
+    ok = j.get("success") is True
+    for k in ("verified", "found", "paid", "valid"):
+        if k in j and not j[k]:
+            ok = False
+    if str(j.get("status") or "").lower() in ("failed", "not_found", "notfound", "pending", "invalid", "error"):
+        ok = False
+    paid = _to_float(j.get("amount"))
+    if ok and paid is not None and paid + 0.011 < float(amount):
+        ok, msg = False, "Amount mismatch"
+    return {"ok": ok, "message": msg, "amount": paid}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATABASE LAYER
+# ═══════════════════════════════════════════════════════════════════
+
+class Database:
+    def __init__(self, name: str):
+        self.name = name
+        self.init_db()
+        self.migrate()
+        self.seed_default_data()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.name, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _run(self, sql: str, params=(), fetch: Optional[str] = None):
+        """fetch: 'one' | 'all' | 'id' (lastrowid) | None (rowcount)."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(sql, params)
+            if fetch == "one":
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetch == "all":
+                return [dict(r) for r in cur.fetchall()]
+            conn.commit()
+            if fetch == "id":
+                return cur.lastrowid
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    # ─── schema ───
+    def init_db(self):
+        conn = self._connect()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id BIGINT UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                balance DECIMAL(10,2) DEFAULT 0,
+                referral_code TEXT UNIQUE,
+                referred_by INTEGER,
+                referral_earnings DECIMAL(10,2) DEFAULT 0,
+                total_orders INTEGER DEFAULT 0,
+                banned INTEGER DEFAULT 0,
+                active_coupon TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                description TEXT,
+                image_file_id TEXT,
+                status TEXT DEFAULT 'active',
+                use_api INTEGER DEFAULT 1,
+                api_version TEXT DEFAULT 'v2',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS product_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                plan_name TEXT NOT NULL,
+                price DECIMAL(10,2) NOT NULL,
+                api_hours INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                plan_id INTEGER NOT NULL,
+                plan_name TEXT NOT NULL,
+                price DECIMAL(10,2) NOT NULL,
+                key_code TEXT,
+                android_id TEXT,
+                api_response TEXT,
+                status TEXT DEFAULT 'completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                utr TEXT,
+                screenshot_file_id TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS coupons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                type TEXT NOT NULL,
+                value DECIMAL(10,2) NOT NULL,
+                expiry_date TIMESTAMP,
+                usage_limit INTEGER DEFAULT 1,
+                used_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS coupon_uses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coupon_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (coupon_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id BIGINT NOT NULL,
+                action TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_owner ON media(owner);
+        """)
+        conn.commit()
+        conn.close()
+
+    def migrate(self):
+        """Adds new columns to databases created by the old version."""
+        conn = self._connect()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+            if "banned" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
+            if "active_coupon" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN active_coupon TEXT")
+            tcols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)")}
+            for col, ddl in (("order_id", "TEXT"), ("payable_amount", "DECIMAL(10,2)"),
+                             ("chat_id", "BIGINT"), ("message_id", "INTEGER")):
+                if col not in tcols:
+                    conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {ddl}")
+            pcols = {r[1] for r in conn.execute("PRAGMA table_info(products)")}
+            for col in ("vip_link", "vip_title", "demo_link", "demo_title"):
+                if col not in pcols:
+                    conn.execute(f"ALTER TABLE products ADD COLUMN {col} TEXT")
+            ocols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+            for col in ("vip_link", "expires_at"):
+                if col not in ocols:
+                    conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_order ON transactions(order_id)")
+            try:  # a UTR can be credited only once
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_utr_approved "
+                             "ON transactions(utr) WHERE utr IS NOT NULL AND status = 'approved'")
+            except sqlite3.DatabaseError as e:
+                logger.warning(f"Could not create unique UTR index: {e}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def seed_default_data(self):
+        """Only seeds a demo product on a completely empty store."""
+        row = self._run("SELECT COUNT(*) AS n FROM products", fetch="one")
+        if row and row["n"] > 0:
+            return
+        pid = self.create_product(
+            "BALA MOD MENU", "🎮 Gaming",
+            "⚡ Fast Delivery\n🔒 Secure License Access\n💎 Reliable Service",
+        )
+        for name, price, hours in [("1 Hour", 25, 1), ("3 Hours", 55, 3), ("6 Hours", 95, 6),
+                                   ("12 Hours", 190, 12), ("1 Day", 290, 24)]:
+            self.add_product_plan(pid, name, price, hours)
+
+    # ─── users ───
+    def get_user(self, telegram_id: int) -> Optional[Dict]:
+        return self._run("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,), "one")
+
+    def get_user_by_id(self, user_id: int) -> Optional[Dict]:
+        return self._run("SELECT * FROM users WHERE id = ?", (user_id,), "one")
+
+    def get_user_by_ref(self, code: str) -> Optional[Dict]:
+        return self._run("SELECT * FROM users WHERE referral_code = ?", (code,), "one")
+
+    def find_user(self, q: str) -> Optional[Dict]:
+        q = q.strip().lstrip("@")
+        if q.isdigit():
+            return self.get_user(int(q))
+        return self._run("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (q,), "one")
+
+    def create_user(self, telegram_id, username, first_name, referred_by=None):
+        code = "SANDY" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        try:
+            self._run(
+                "INSERT INTO users (telegram_id, username, first_name, referral_code, referred_by) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (telegram_id, username, first_name, code, referred_by),
+            )
+        except sqlite3.IntegrityError:
+            pass
+
+    def update_user_info(self, telegram_id, username, first_name):
+        self._run("UPDATE users SET username = ?, first_name = ? WHERE telegram_id = ?",
+                  (username, first_name, telegram_id))
+
+    def update_balance(self, telegram_id: int, amount: float):
+        self._run("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (amount, telegram_id))
+
+    def deduct_balance(self, telegram_id: int, amount: float) -> bool:
+        """Atomic: only deducts if balance is enough."""
+        n = self._run(
+            "UPDATE users SET balance = balance - ? WHERE telegram_id = ? AND balance >= ? - 0.001",
+            (amount, telegram_id, amount),
+        )
+        return n > 0
+
+    def credit_referral(self, telegram_id: int, amount: float):
+        self._run(
+            "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? "
+            "WHERE telegram_id = ?", (amount, amount, telegram_id))
+
+    def increment_orders(self, telegram_id: int):
+        self._run("UPDATE users SET total_orders = total_orders + 1 WHERE telegram_id = ?", (telegram_id,))
+
+    def set_banned(self, telegram_id: int, banned: bool):
+        self._run("UPDATE users SET banned = ? WHERE telegram_id = ?", (1 if banned else 0, telegram_id))
+
+    def set_active_coupon(self, telegram_id: int, code: Optional[str]):
+        self._run("UPDATE users SET active_coupon = ? WHERE telegram_id = ?", (code, telegram_id))
+
+    def get_all_users(self, limit: int = 50, offset: int = 0) -> List[Dict]:
+        return self._run("SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                         (limit, offset), "all")
+
+    def count_users(self) -> int:
+        return self._run("SELECT COUNT(*) AS n FROM users", fetch="one")["n"]
+
+    # ─── products ───
+    def get_products(self, group: Optional[str] = None, include_inactive: bool = False) -> List[Dict]:
+        sql = "SELECT * FROM products WHERE 1=1"
+        params: list = []
+        if not include_inactive:
+            sql += " AND status = 'active'"
+        if group:
+            sql += " AND group_name = ?"
+            params.append(group)
+        return self._run(sql + " ORDER BY id", tuple(params), "all")
+
+    def get_product(self, product_id: int) -> Optional[Dict]:
+        return self._run("SELECT * FROM products WHERE id = ?", (product_id,), "one")
+
+    def get_product_plans(self, product_id: int) -> List[Dict]:
+        return self._run("SELECT * FROM product_plans WHERE product_id = ? ORDER BY price", (product_id,), "all")
+
+    def get_plan(self, plan_id: int) -> Optional[Dict]:
+        return self._run("SELECT * FROM product_plans WHERE id = ?", (plan_id,), "one")
+
+    def create_product(self, name, group, description, use_api=1, api_version="v2",
+                       vip_link=None, demo_link=None) -> int:
+        return self._run(
+            "INSERT INTO products (name, group_name, description, use_api, api_version, vip_link, demo_link) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, group, description, use_api, api_version, vip_link, demo_link), "id")
+
+    def add_product_plan(self, product_id, plan_name, price, api_hours=None):
+        self._run("INSERT INTO product_plans (product_id, plan_name, price, api_hours) VALUES (?, ?, ?, ?)",
+                  (product_id, plan_name, price, api_hours))
+
+    def update_plan_price(self, plan_id: int, price: float):
+        self._run("UPDATE product_plans SET price = ? WHERE id = ?", (price, plan_id))
+
+    def update_plan_name(self, plan_id: int, name: str, hours: int):
+        self._run("UPDATE product_plans SET plan_name = ?, api_hours = ? WHERE id = ?", (name, hours, plan_id))
+
+    PRODUCT_COLUMNS = ("name", "description", "vip_link", "vip_title", "demo_link", "demo_title")
+
+    def update_product_field(self, product_id: int, column: str, value: Optional[str]):
+        if column not in self.PRODUCT_COLUMNS:
+            raise ValueError(f"column not allowed: {column}")
+        self._run(f"UPDATE products SET {column} = ? WHERE id = ?", (value, product_id))
+
+    def set_product_api(self, product_id: int, use_api: int):
+        self._run("UPDATE products SET use_api = ? WHERE id = ?", (1 if use_api else 0, product_id))
+
+    def set_product_status(self, product_id: int, status: str):
+        self._run("UPDATE products SET status = ? WHERE id = ?", (status, product_id))
+
+    def delete_product(self, product_id: int):
+        self._run("DELETE FROM product_plans WHERE product_id = ?", (product_id,))
+        self._run("DELETE FROM media WHERE owner LIKE ?", (f"p{product_id}:%",))
+        self._run("DELETE FROM products WHERE id = ?", (product_id,))
+
+    def get_product_groups(self) -> List[str]:
+        rows = self._run("SELECT DISTINCT group_name FROM products WHERE status = 'active'", fetch="all")
+        return [r["group_name"] for r in rows]
+
+    # ─── media (photos / videos for the welcome screen, products and demos) ───
+    def add_media(self, owner: str, file_id: str, media_type: str):
+        self._run("INSERT INTO media (owner, file_id, media_type) VALUES (?, ?, ?)",
+                  (owner, file_id, media_type))
+
+    def get_media(self, owner: str) -> List[Dict]:
+        return self._run("SELECT * FROM media WHERE owner = ? ORDER BY id", (owner,), "all")
+
+    def count_media(self, owner: str) -> int:
+        return self._run("SELECT COUNT(*) AS n FROM media WHERE owner = ?", (owner,), "one")["n"]
+
+    def clear_media(self, owner: str):
+        self._run("DELETE FROM media WHERE owner = ?", (owner,))
+
+    # ─── orders ───
+    def create_order(self, order_id, user_id, product_id, plan_id, plan_name, price,
+                     key_code=None, android_id=None, api_response=None, vip_link=None, expires_at=None):
+        self._run(
+            "INSERT INTO orders (order_id, user_id, product_id, plan_id, plan_name, price, key_code, android_id, "
+            "api_response, vip_link, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (order_id, user_id, product_id, plan_id, plan_name, price, key_code, android_id, api_response,
+             vip_link, expires_at))
+
+    def get_user_orders(self, user_id: int, limit: int = 10) -> List[Dict]:
+        return self._run(
+            "SELECT o.*, COALESCE(p.name, 'Removed product') AS product_name "
+            "FROM orders o LEFT JOIN products p ON o.product_id = p.id "
+            "WHERE o.user_id = ? ORDER BY o.id DESC LIMIT ?", (user_id, limit), "all")
+
+    def get_all_orders(self, limit: int = 50) -> List[Dict]:
+        return self._run(
+            "SELECT o.*, COALESCE(p.name, 'Removed product') AS product_name, u.username, u.telegram_id "
+            "FROM orders o LEFT JOIN products p ON o.product_id = p.id "
+            "JOIN users u ON o.user_id = u.id ORDER BY o.id DESC LIMIT ?", (limit,), "all")
+
+    def count_orders(self) -> int:
+        return self._run("SELECT COUNT(*) AS n FROM orders WHERE status = 'completed'", fetch="one")["n"]
+
+    def get_total_revenue(self) -> float:
+        r = self._run("SELECT COALESCE(SUM(price), 0) AS s FROM orders WHERE status = 'completed'", fetch="one")
+        return float(r["s"])
+
+    def sales_today(self):
+        mod = f"{TZ_OFFSET_MIN:+d} minutes"
+        r = self._run(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(price), 0) AS s FROM orders "
+            "WHERE status = 'completed' AND DATE(created_at, ?) = DATE('now', ?)", (mod, mod), "one")
+        return r["c"], float(r["s"])
+
+    def sales_last_days(self, days: int):
+        r = self._run(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(price), 0) AS s FROM orders "
+            "WHERE status = 'completed' AND created_at >= datetime('now', ?)", (f"-{days} days",), "one")
+        return r["c"], float(r["s"])
+
+    # ─── transactions (auto-verified UPI payments) ───
+    def create_payment_tx(self, user_id: int, amount: float, order_id: str,
+                          payable: float, chat_id: int) -> int:
+        return self._run(
+            "INSERT INTO transactions (user_id, type, amount, order_id, payable_amount, chat_id) "
+            "VALUES (?, 'recharge', ?, ?, ?, ?)", (user_id, amount, order_id, payable, chat_id), "id")
+
+    def set_tx_message(self, tx_id: int, message_id: int):
+        self._run("UPDATE transactions SET message_id = ? WHERE id = ?", (message_id, tx_id))
+
+    def get_transaction(self, tx_id: int) -> Optional[Dict]:
+        return self._run("SELECT * FROM transactions WHERE id = ?", (tx_id,), "one")
+
+    def get_tx_by_order(self, order_id: str) -> Optional[Dict]:
+        return self._run("SELECT * FROM transactions WHERE order_id = ?", (order_id,), "one")
+
+    def get_user_transactions(self, user_id: int, limit: int = 10) -> List[Dict]:
+        return self._run("SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                         (user_id, limit), "all")
+
+    def get_pending_transactions(self) -> List[Dict]:
+        """Payments waiting for the user to pay (auto-checked by the poll job)."""
+        return self._run(
+            "SELECT t.*, u.telegram_id, u.username FROM transactions t JOIN users u ON t.user_id = u.id "
+            "WHERE t.status = 'pending' AND t.order_id IS NOT NULL ORDER BY t.id", fetch="all")
+
+    def get_total_pending_amount(self) -> float:
+        r = self._run("SELECT COALESCE(SUM(amount), 0) AS s FROM transactions "
+                      "WHERE status = 'pending' AND order_id IS NOT NULL", fetch="one")
+        return float(r["s"])
+
+    def count_open_payments(self, user_id: int, minutes: int = 10) -> int:
+        r = self._run(
+            "SELECT COUNT(*) AS n FROM transactions WHERE user_id = ? AND status = 'pending' "
+            "AND order_id IS NOT NULL AND created_at >= datetime('now', ?)",
+            (user_id, f"-{minutes} minutes"), "one")
+        return int(r["n"])
+
+    def utr_registered(self, utr: str) -> bool:
+        return self._run("SELECT id FROM transactions WHERE utr = ? AND status = 'approved'",
+                         (utr,), "one") is not None
+
+    def set_tx_status(self, tx_id: int, status: str, allowed=("pending",)) -> bool:
+        marks = ",".join("?" * len(allowed))
+        return self._run(f"UPDATE transactions SET status = ? WHERE id = ? AND status IN ({marks})",
+                         (status, tx_id, *allowed)) > 0
+
+    def credit_payment(self, tx_id: int, utr: Optional[str]) -> str:
+        """Atomic: registers the UTR and credits the wallet exactly once.
+        Returns: ok | done (already credited) | duplicate (UTR already used) | invalid"""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tx = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
+            if not tx:
+                conn.rollback()
+                return "invalid"
+            if tx["status"] == "approved":
+                conn.rollback()
+                return "done"
+            if tx["status"] not in ("pending", "expired"):
+                conn.rollback()
+                return "invalid"
+            if utr and conn.execute("SELECT 1 FROM transactions WHERE utr = ? AND status = 'approved'",
+                                    (utr,)).fetchone():
+                conn.execute("UPDATE transactions SET status = 'duplicate' WHERE id = ?", (tx_id,))
+                conn.commit()
+                return "duplicate"
+            conn.execute("UPDATE transactions SET status = 'approved', utr = ? WHERE id = ?",
+                         (utr or None, tx_id))
+            conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?",
+                         (float(tx["amount"]), tx["user_id"]))
+            conn.commit()
+            return "ok"
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def expire_stale(self, minutes: int) -> int:
+        """Payment sessions that stayed unpaid for too long."""
+        return self._run(
+            "UPDATE transactions SET status = 'expired' "
+            "WHERE status = 'pending' AND order_id IS NOT NULL AND created_at < datetime('now', ?)",
+            (f"-{minutes} minutes",))
+
+    # ─── coupons ───
+    def get_coupon(self, code: str) -> Optional[Dict]:
+        return self._run("SELECT * FROM coupons WHERE code = ?", (code.upper(),), "one")
+
+    def redeem_coupon(self, code: str, user_id: int):
+        """Returns (status, coupon). status: invalid | used | limit | ok."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM coupons WHERE code = ? AND (expiry_date IS NULL OR expiry_date > datetime('now'))",
+                (code.upper(),)).fetchone()
+            if not row:
+                return "invalid", None
+            c = dict(row)
+            if conn.execute("SELECT 1 FROM coupon_uses WHERE coupon_id = ? AND user_id = ?",
+                            (c["id"], user_id)).fetchone():
+                return "used", c
+            cur = conn.execute(
+                "UPDATE coupons SET used_count = used_count + 1 WHERE id = ? AND used_count < usage_limit",
+                (c["id"],))
+            if cur.rowcount == 0:
+                return "limit", c
+            conn.execute("INSERT INTO coupon_uses (coupon_id, user_id) VALUES (?, ?)", (c["id"], user_id))
+            conn.commit()
+            return "ok", c
+        finally:
+            conn.close()
+
+    def create_coupon(self, code, type_, value, expiry_days=None, limit=1):
+        expiry = None
+        if expiry_days:
+            expiry = (datetime.now(timezone.utc) + timedelta(days=expiry_days)).strftime("%Y-%m-%d %H:%M:%S")
+        self._run("INSERT INTO coupons (code, type, value, expiry_date, usage_limit) VALUES (?, ?, ?, ?, ?)",
+                  (code.upper(), type_, value, expiry, limit))
+
+    def get_all_coupons(self) -> List[Dict]:
+        return self._run("SELECT * FROM coupons ORDER BY id DESC LIMIT 30", fetch="all")
+
+    def delete_coupon(self, coupon_id: int):
+        self._run("DELETE FROM coupons WHERE id = ?", (coupon_id,))
+
+    def delete_plan(self, plan_id: int):
+        self._run("DELETE FROM product_plans WHERE id = ?", (plan_id,))
+
+    # ─── admin log ───
+    def log_admin(self, admin_id: int, action: str):
+        logger.info(f"ADMIN {admin_id}: {action}")
+        self._run("INSERT INTO admin_logs (admin_id, action) VALUES (?, ?)", (admin_id, action))
+
+    def get_logs(self, limit: int = 15) -> List[Dict]:
+        return self._run("SELECT * FROM admin_logs ORDER BY id DESC LIMIT ?", (limit,), "all")
+
+    # ─── settings ───
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        r = self._run("SELECT value FROM settings WHERE key = ?", (key,), "one")
+        return r["value"] if r and r["value"] is not None else default
+
+    def set_setting(self, key: str, value: Optional[str]):
+        if value is None:
+            self._run("DELETE FROM settings WHERE key = ?", (key,))
+        else:
+            self._run("INSERT INTO settings (key, value) VALUES (?, ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+    # ─── stats / leaderboards ───
+    def get_top_buyers(self, limit: int = 10) -> List[Dict]:
+        return self._run(
+            "SELECT u.*, SUM(o.price) AS spent, COUNT(o.id) AS cnt FROM users u "
+            "JOIN orders o ON o.user_id = u.id AND o.status = 'completed' "
+            "GROUP BY u.id ORDER BY spent DESC LIMIT ?", (limit,), "all")
+
+    def get_top_referrers(self, limit: int = 10) -> List[Dict]:
+        return self._run(
+            "SELECT * FROM (SELECT u.*, (SELECT COUNT(*) FROM users r WHERE r.referred_by = u.id) AS refs "
+            "FROM users u) WHERE refs > 0 ORDER BY refs DESC, referral_earnings DESC LIMIT ?", (limit,), "all")
+
+    def get_top_products(self, limit: int = 5) -> List[Dict]:
+        return self._run(
+            "SELECT COALESCE(p.name, 'Removed product') AS name, COUNT(o.id) AS cnt, SUM(o.price) AS total "
+            "FROM orders o LEFT JOIN products p ON o.product_id = p.id WHERE o.status = 'completed' "
+            "GROUP BY o.product_id ORDER BY total DESC LIMIT ?", (limit,), "all")
+
+    def get_banned_users(self) -> List[Dict]:
+        return self._run("SELECT * FROM users WHERE banned = 1 ORDER BY id DESC LIMIT 30", fetch="all")
+
+    def new_users_today(self) -> int:
+        mod = f"{TZ_OFFSET_MIN:+d} minutes"
+        return self._run("SELECT COUNT(*) AS n FROM users WHERE DATE(created_at, ?) = DATE('now', ?)",
+                         (mod, mod), "one")["n"]
+
+    def total_wallet_balance(self) -> float:
+        return float(self._run("SELECT COALESCE(SUM(balance), 0) AS s FROM users", fetch="one")["s"])
+
+    def backup_to(self, path: str):
+        src = self._connect()
+        dst = sqlite3.connect(path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+
+db = Database(DB_NAME)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════════
+
+esc = html.escape
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def generate_order_id() -> str:
+    return "".join(random.choices(string.digits, k=8))
+
+
+def fmt_money(amount) -> str:
+    try:
+        v = round(float(amount), 2)
+    except (TypeError, ValueError):
+        return f"₹{amount}"
+    return f"₹{int(v)}" if v == int(v) else f"₹{v:.2f}"
+
+
+def fmt_time(ts, fmt="%d %b %Y, %I:%M %p") -> str:
+    if not ts:
+        return "N/A"
+    try:
+        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S") + timedelta(minutes=TZ_OFFSET_MIN)
+        return dt.strftime(fmt)
+    except ValueError:
+        return str(ts)
+
+
+def uname(u: Dict) -> str:
+    if u.get("username"):
+        return "@" + esc(u["username"])
+    return esc(u.get("first_name") or str(u.get("telegram_id")))
+
+
+def guess_hours(plan_name: str) -> Optional[int]:
+    """Plan duration in hours: '2 Days' -> 48, '1 Month' -> 720, 'Lifetime' -> 0, unknown -> None."""
+    name = plan_name.strip()
+    if name in API_HOURS_MAP:
+        return API_HOURS_MAP[name]
+    low = name.lower()
+    m = re.search(r"(\d+)\s*(hours?|hrs?|h|days?|d|weeks?|w|months?|mo|years?|y)\b", low)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit.startswith("mo"):
+            return n * 720
+        if unit.startswith("h"):
+            return n
+        if unit.startswith("d"):
+            return n * 24
+        if unit.startswith("w"):
+            return n * 168
+        return n * 8760  # years
+    if re.search(r"life\s*-?\s*time|forever|permanent|unlimited", low):
+        return 0
+    return None
+
+
+def fmt_duration(hours) -> str:
+    """48 -> '2 Days', 5 -> '5 Hours', 0 -> 'Lifetime', None -> ''."""
+    if hours is None:
+        return ""
+    h = int(hours)
+    if h == 0:
+        return "Lifetime"
+    if h < 24 or h % 24:
+        return f"{h} Hour{'s' if h != 1 else ''}"
+    d = h // 24
+    return f"{d} Day{'s' if d != 1 else ''}"
+
+
+def norm_link(text: str) -> Optional[str]:
+    """Accepts https://t.me/..., t.me/..., @username, any http(s) link. Returns a clean URL or None."""
+    t = (text or "").strip()
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,32}", t):
+        return "https://t.me/" + t[1:]
+    if re.match(r"(t\.me|telegram\.me)/", t, re.I):
+        t = "https://" + t
+    if re.fullmatch(r"https?://\S{4,300}", t, re.I):
+        return t
+    return None
+
+
+def utc_now_str(add_hours: float = 0) -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=add_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def generate_upi_qr(amount: float) -> io.BytesIO:
+    url = f"upi://pay?pa={UPI_ID}&pn={quote(STORE_NAME)}&am={amount:.2f}&cu=INR"
+    bio = io.BytesIO()
+    qrcode.make(url).save(bio, "PNG")
+    bio.seek(0)
+    return bio
+
+
+# ─── media: multiple photos / videos (welcome screen, products, demos) ───
+_media_msgs: Dict[int, List[int]] = {}   # chat_id -> album message ids, deleted when the user opens the next screen
+
+
+async def send_media(bot, chat_id: int, items: List[Dict]) -> None:
+    """Sends photos/videos (single or albums of up to 10) and remembers the messages for clean-up."""
+    ids: List[int] = []
+    for i in range(0, len(items), 10):
+        chunk = items[i:i + 10]
+        try:
+            if len(chunk) == 1:
+                m = chunk[0]
+                if m["media_type"] == "video":
+                    s = await bot.send_video(chat_id, m["file_id"])
+                else:
+                    s = await bot.send_photo(chat_id, m["file_id"])
+                ids.append(s.message_id)
+            else:
+                group = [InputMediaVideo(m["file_id"]) if m["media_type"] == "video"
+                         else InputMediaPhoto(m["file_id"]) for m in chunk]
+                sent = await bot.send_media_group(chat_id, group)
+                ids.extend(s.message_id for s in sent)
+        except Exception as e:
+            logger.warning(f"send_media failed: {e}")
+    if ids:
+        _media_msgs.setdefault(chat_id, []).extend(ids)
+
+
+async def clear_media(bot, chat_id: int) -> None:
+    ids = _media_msgs.pop(chat_id, None)
+    if not ids:
+        return
+    try:
+        await bot.delete_messages(chat_id, ids)
+        return
+    except Exception:
+        pass
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+# ─── settings that the admin can change from the panel ───
+SETTING_DEFS = {   # key: (button label, kind, config variable)
+    "upi_id": ("💳 UPI ID", "upi", "UPI_ID"),
+    "store_name": ("🏪 Store Name", "text", "STORE_NAME"),
+    "support": ("📞 Support Username", "user", "SUPPORT_USERNAME"),
+    "min_recharge": ("⬇️ Min Recharge", "num", "MIN_RECHARGE"),
+    "max_recharge": ("⬆️ Max Recharge", "num", "MAX_RECHARGE"),
+    "referral_percent": ("🎁 Referral %", "pct", "REFERRAL_PERCENT"),
+}
+
+
+def apply_settings():
+    """Loads the values changed from the admin panel over the defaults from the code/.env."""
+    g = globals()
+    for key, (_label, kind, var) in SETTING_DEFS.items():
+        val = _DEFAULT_CFG[var]
+        raw = db.get_setting(key)
+        if raw not in (None, ""):
+            try:
+                val = float(raw) if kind in ("num", "pct") else raw
+            except ValueError:
+                pass
+        g[var] = val
+
+
+def validate_setting(kind: str, text: str, key: str):
+    """-> (value_to_store, error_message)."""
+    t = text.strip()
+    if kind == "upi":
+        if not re.fullmatch(r"[A-Za-z0-9._\-]{2,64}@[A-Za-z0-9]{2,32}", t):
+            return None, "❌ Invalid UPI ID. Example: <code>name@bank</code>"
+        return t, None
+    if kind == "text":
+        if not 1 <= len(t) <= 40:
+            return None, "❌ Name must be 1-40 characters."
+        return t, None
+    if kind == "user":
+        u = t.lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", u):
+            return None, "❌ Send a valid Telegram username, example <code>@yourname</code>"
+        return "@" + u, None
+    try:
+        v = float(t)
+    except ValueError:
+        return None, "❌ Send a valid number."
+    if kind == "pct":
+        if not 0 <= v <= 50:
+            return None, "❌ Percent must be between 0 and 50."
+    else:
+        if v <= 0:
+            return None, "❌ Amount must be greater than 0."
+        if key == "min_recharge" and v > MAX_RECHARGE:
+            return None, f"❌ Min cannot be more than the max ({fmt_money(MAX_RECHARGE)})."
+        if key == "max_recharge" and v < MIN_RECHARGE:
+            return None, f"❌ Max cannot be less than the min ({fmt_money(MIN_RECHARGE)})."
+    return (str(int(v)) if v == int(v) else str(v)), None
+
+
+# ─── flood protection / locks ───
+_last_action: Dict[int, float] = {}
+_locks: Dict[int, asyncio.Lock] = {}
+
+
+def flooded(uid: int, gap: float = 0.5) -> bool:
+    now = time.monotonic()
+    if now - _last_action.get(uid, 0) < gap:
+        return True
+    _last_action[uid] = now
+    return False
+
+
+def user_lock(uid: int) -> asyncio.Lock:
+    return _locks.setdefault(uid, asyncio.Lock())
+
+
+# ─── bold text helpers ───
+DIV = "━━━━━━━━━━━━━━━━━━━━"
+RAW = "⁣"  # prefix: send this text exactly as given (used for broadcast)
+
+_BOLD_TABLE = {}
+for _i, _c in enumerate(string.ascii_uppercase):
+    _BOLD_TABLE[ord(_c)] = chr(0x1D5D4 + _i)
+for _i, _c in enumerate(string.ascii_lowercase):
+    _BOLD_TABLE[ord(_c)] = chr(0x1D5EE + _i)
+for _i, _c in enumerate(string.digits):
+    _BOLD_TABLE[ord(_c)] = chr(0x1D7EC + _i)
+
+
+def bold(s: str) -> str:
+    """Unicode bold letters - used for button labels (buttons cannot use HTML)."""
+    return s.translate(_BOLD_TABLE)
+
+
+_SKIP_SEGMENTS = re.compile(r"(<code>.*?</code>|<pre>.*?</pre>|<a .*?</a>|<s>.*?</s>)")
+
+
+def boldify(text: str) -> str:
+    """Makes every line of an HTML message bold (code blocks stay as they are)."""
+    out = []
+    for line in text.split("\n"):
+        parts = _SKIP_SEGMENTS.split(line)
+        new = []
+        for p in parts:
+            if p.startswith(("<code>", "<pre>", "<a ", "<s>")):
+                new.append(p)
+            else:
+                q = p.replace("<b>", "").replace("</b>", "")
+                new.append(f"<b>{q}</b>" if q.strip() else q)
+        out.append("".join(new))
+    return "\n".join(out)
+
+
+class BoldBot(ExtBot):
+    """Bot that automatically makes all outgoing messages bold."""
+
+    @staticmethod
+    def _fix(text):
+        if not isinstance(text, str):
+            return text
+        if text.startswith(RAW):
+            return text[len(RAW):]
+        return boldify(text)
+
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        return await super().send_message(chat_id, self._fix(text), *args, **kwargs)
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        return await super().edit_message_text(self._fix(text), *args, **kwargs)
+
+    async def send_photo(self, chat_id, photo, caption=None, *args, **kwargs):
+        return await super().send_photo(chat_id, photo, self._fix(caption), *args, **kwargs)
+
+    async def send_document(self, chat_id, document, caption=None, *args, **kwargs):
+        return await super().send_document(chat_id, document, self._fix(caption), *args, **kwargs)
+
+    async def edit_message_caption(self, *args, caption=None, **kwargs):
+        return await super().edit_message_caption(*args, caption=self._fix(caption), **kwargs)
+
+
+# ─── colourful bold buttons (Bot API 9.4 `style`) ───
+def btn(text: str, cb: Optional[str] = None, style: Optional[str] = "primary", url: Optional[str] = None):
+    """Every button is coloured + bold. style: 'primary' blue | 'success' green | 'danger' red.
+    Falls back safely (no colour) on old library versions."""
+    label = bold(text)
+    kw: Dict[str, Any] = {}
+    if cb:
+        kw["callback_data"] = cb
+    if url:
+        kw["url"] = url
+    if style:
+        try:
+            return InlineKeyboardButton(label, style=style, **kw)
+        except TypeError:
+            try:
+                return InlineKeyboardButton(label, api_kwargs={"style": style}, **kw)
+            except TypeError:
+                pass
+    return InlineKeyboardButton(label, **kw)
+
+
+def kb(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows)
+
+
+def back_btn(to: str) -> InlineKeyboardMarkup:
+    return kb([[btn("⬅️ Back", f"back:{to}", "primary")]])
+
+
+def cancel_row():
+    return [btn("❌ Cancel", "cancel_action", "danger")]
+
+
+def head(icon: str, title: str) -> str:
+    return f"{icon} <b>{title}</b>\n{DIV}\n"
+
+
+def mask_name(u: Dict) -> str:
+    name = u.get("username") or u.get("first_name") or "user"
+    return esc(name[:2] + "•••")
+
+
+def main_menu(user_id: int) -> InlineKeyboardMarkup:
+    # every active product (added from the admin panel) is a button right on the main page
+    rows = [[btn(p["name"], f"prod:{p['id']}", "primary")] for p in db.get_products()]
+    rows += [
+        [btn("💰 Wallet", "wallet", "success"), btn("📦 My Orders", "orders", "primary")],
+        [btn("👤 Profile", "profile", "primary"), btn("🎁 Redeem Coupon", "redeem_coupon", "success")],
+        [btn("📖 Help", "help", "success"), btn("📞 Support", "support", "primary")],
+    ]
+    if is_admin(user_id):
+        rows.append([btn("⚙️ Admin Panel", "admin", "danger")])
+    return kb(rows)
+
+
+def welcome_text(user: Dict) -> str:
+    custom = db.get_setting("welcome_msg")
+    body = custom if custom else (
+        "🛒 Your Trusted Gaming Services Store\n\n"
+        "⚡ Fast Delivery\n🔒 Safe &amp; Secure\n💎 Premium Services")
+    return (
+        f"👋 <b>Welcome to {esc(STORE_NAME)}</b>\n{DIV}\n"
+        f"{body}\n{DIV}\n"
+        f"💰 Balance: <b>{fmt_money(user['balance'])}</b>\n\n"
+        f"Please select an option below 👇"
+    )
+
+
+def gate_text(user: Dict, uid: int) -> Optional[str]:
+    """Returns a message if this user must be blocked (banned / maintenance)."""
+    if is_admin(uid):
+        return None
+    if user.get("banned"):
+        return f"🚫 <b>You are banned.</b>\n\nContact {esc(SUPPORT_USERNAME)}"
+    if db.get_setting("maintenance") == "1":
+        return ("🔧 <b>Bot Under Maintenance</b>\n\nWe will be back very soon.\n"
+                f"Support: {esc(SUPPORT_USERNAME)}")
+    return None
+
+
+def help_text() -> str:
+    return (
+        head("📖", "Help Guide") +
+        "🛒 Products - Tap any product on the main page to see plans, demo and buy\n"
+        "💰 Wallet - Add balance via UPI\n"
+        "📦 Orders - Your purchases, VIP links and keys\n"
+        "👤 Profile - Stats and referral link\n"
+        "🎁 Coupons - Redeem discount codes\n\n"
+        f"{DIV}\n💳 <b>How to add balance?</b>\n"
+        f"1. Wallet → Add Balance\n2. Select amount\n3. Pay the exact amount to <code>{esc(UPI_ID)}</code>\n"
+        "4. Tap <b>I Paid</b> and send your 12-digit UTR\n5. Balance is added instantly after verification ✅\n\n"
+        f"📞 Support: {esc(SUPPORT_USERNAME)}"
+    )
+
+
+async def edit(query, text: str, markup=None):
+    """Edit the message, whether it is text or a photo. Falls back to delete + resend."""
+    try:
+        if query.message and (query.message.photo or query.message.video or query.message.animation):
+            await query.edit_message_caption(caption=text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        return
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await query.get_bot().send_message(
+        chat_id=query.message.chat_id, text=text, reply_markup=markup, parse_mode="HTML")
+
+
+async def notify_admins(bot, text: str, markup=None, photo: Optional[str] = None):
+    for aid in ADMIN_IDS:
+        try:
+            if photo:
+                await bot.send_photo(aid, photo, caption=text, reply_markup=markup, parse_mode="HTML")
+            else:
+                await bot.send_message(aid, text, reply_markup=markup, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Could not notify admin {aid}: {e}")
+
+
+async def show_main(bot, chat_id: int, user: Dict, query=None):
+    """Main page: optional welcome photos/videos, then the welcome text with all product buttons."""
+    text = welcome_text(user)
+    markup = main_menu(user["telegram_id"])
+    media = db.get_media("welcome")
+    if media:
+        if query:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        await send_media(bot, chat_id, media)
+        await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    elif query:
+        await edit(query, text, markup)
+    else:
+        await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def ensure_user(tg_user, referred_by: Optional[int] = None) -> Dict:
+    user = db.get_user(tg_user.id)
+    if not user:
+        db.create_user(tg_user.id, tg_user.username, tg_user.first_name, referred_by)
+        user = db.get_user(tg_user.id)
+    elif user.get("username") != tg_user.username:
+        db.update_user_info(tg_user.id, tg_user.username, tg_user.first_name)
+        user["username"] = tg_user.username
+    return user
+
+
+# ═══════════════════════════════════════════════════════════════════
+# API INTEGRATION
+# ═══════════════════════════════════════════════════════════════════
+
+KEY_FIELDS = ("key", "license", "license_key", "licenseKey", "token")
+
+
+def extract_key(d: Any) -> Optional[str]:
+    if not isinstance(d, dict):
+        return None
+    sources = [d]
+    for nested in ("data", "result"):
+        if isinstance(d.get(nested), dict):
+            sources.append(d[nested])
+    for src in sources:
+        for f in KEY_FIELDS:
+            v = src.get(f)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    skip = {"message", "msg", "status", "error", "detail"}
+    for k, v in d.items():
+        if k not in skip and isinstance(v, str) and len(v) > 10:
+            return v
+    return None
+
+
+def api_error(d: Dict) -> Optional[str]:
+    if d.get("error"):
+        return str(d["error"])
+    if d.get("success") is False or str(d.get("status", "")).lower() in ("error", "failed", "fail"):
+        return str(d.get("message") or d.get("msg") or "API request failed")
+    return None
+
+
+async def generate_key_via_api(hours: int, version: str = "v2", android_id: Optional[str] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"hours": hours}
+    if version == "v1":
+        payload["version"] = "v1"
+        payload["android_id"] = android_id or "unknown"
+    try:
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: requests.post(API_URL, headers=API_HEADERS, json=payload, timeout=30))
+        try:
+            data = resp.json()
+        except ValueError:
+            return {"error": f"Invalid API response (HTTP {resp.status_code})"}
+        if resp.status_code >= 400 and not api_error(data):
+            data["error"] = f"HTTP {resp.status_code}"
+        logger.info(f"API Response: {data}")
+        return data
+    except Exception as e:
+        logger.error(f"API Error: {e}")
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COMMANDS
+# ═══════════════════════════════════════════════════════════════════
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg = update.effective_user
+    referred_by = None
+    if context.args and context.args[0].startswith("ref_"):
+        ref_user = db.get_user_by_ref(context.args[0][4:])
+        if ref_user and ref_user["telegram_id"] != tg.id:
+            referred_by = ref_user["id"]
+
+    user = ensure_user(tg, referred_by)
+    blocked = gate_text(user, tg.id)
+    if blocked:
+        await update.message.reply_text(blocked)
+        return
+    context.user_data.clear()
+    await clear_media(context.bot, update.effective_chat.id)
+    await show_main(context.bot, update.effective_chat.id, user)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(help_text(), reply_markup=kb([[btn("⬅️ Main Menu", "back:main", "primary")]]))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CALLBACK ROUTER
+# ═══════════════════════════════════════════════════════════════════
+
+ADMIN_PREFIXES = ("admin", "toggle_prod", "del_", "edit_prod",
+                  "edit_plan", "export_orders", "prod_group", "ban_toggle", "add_plan")
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    data = query.data or ""
+    await query.answer()
+
+    if not is_admin(uid) and flooded(uid, 0.4):
+        return
+
+    user = ensure_user(update.effective_user)
+    blocked = gate_text(user, uid)
+    if blocked:
+        await edit(query, blocked)
+        return
+    if data.startswith(ADMIN_PREFIXES) and not is_admin(uid):
+        return
+
+    await clear_media(context.bot, query.message.chat_id)
+    context.user_data.pop("state", None)
+    bot_username = (await context.bot.get_me()).username
+
+    # ─── User navigation ───
+    if data == "store":
+        await show_main(context.bot, query.message.chat_id, user, query)
+    elif data.startswith("prod:"):
+        await show_product(query, context, int(data.split(":")[1]))
+    elif data.startswith("demo:"):
+        await show_demo(query, context, int(data.split(":")[1]))
+    elif data.startswith("buy:"):
+        _, pid, plid = data.split(":")
+        await initiate_purchase(query, context, user, int(pid), int(plid))
+    elif data.startswith("confirm_buy:"):
+        _, pid, plid = data.split(":")
+        await process_purchase(query, context, uid, int(pid), int(plid))
+    elif data == "wallet":
+        await show_wallet(query, user)
+    elif data == "wallet_history":
+        await show_wallet_history(query, user)
+    elif data == "add_balance":
+        await ask_amount(query)
+    elif data.startswith("amount:"):
+        amt = data.split(":")[1]
+        if amt == "custom":
+            context.user_data["state"] = "await_amount"
+            await edit(query, f"💳 <b>Enter amount to add</b>\n\nMinimum {fmt_money(MIN_RECHARGE)}, "
+                              f"maximum {fmt_money(MAX_RECHARGE)}:",
+                       kb([cancel_row()]))
+        else:
+            await send_payment_details(context, query.message.chat_id, float(amt), user, query)
+    elif data.startswith("utr_verify:"):
+        context.user_data["state"] = "await_utr"
+        context.user_data["utr_tx_id"] = int(data.split(":")[1])
+        await context.bot.send_message(
+            query.message.chat_id,
+            "🔢 <b>Send your UTR</b>\n\nEnter the 12-digit UTR / Transaction Reference number of your payment "
+            "(you can find it in your UPI app under payment details):",
+            reply_markup=kb([cancel_row()]), parse_mode="HTML")
+    elif data == "orders":
+        await show_orders(query, user)
+    elif data == "profile":
+        await show_profile(query, user, bot_username)
+    elif data == "support":
+        await edit(query,
+                   head("📞", "Support") +
+                   f"Need help? Contact:\n👤 {esc(SUPPORT_USERNAME)}\n\n"
+                   f"⏰ Response time: 10-30 minutes\nDescribe your issue clearly for quick help.",
+                   kb([[btn("💬 Chat With Support", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}",
+                            style="success")],
+                       [btn("⬅️ Back", "back:main", "primary")]]))
+    elif data == "help":
+        await edit(query, help_text(), kb([[btn("⬅️ Back", "back:main", "primary")]]))
+    elif data == "redeem_coupon":
+        context.user_data["state"] = "await_coupon"
+        await edit(query, "🎁 <b>Enter coupon code:</b>", kb([cancel_row()]))
+    elif data == "referral":
+        await show_referral(query, user, bot_username)
+    elif data.startswith("back:"):
+        dest = data.split(":")[1]
+        if dest in ("main", "store"):
+            await show_main(context.bot, query.message.chat_id, user, query)
+        elif dest == "wallet":
+            await show_wallet(query, user)
+        elif dest == "orders":
+            await show_orders(query, user)
+        elif dest == "profile":
+            await show_profile(query, user, bot_username)
+        elif dest == "admin":
+            await show_admin(query)
+        elif dest == "admin_products":
+            await show_admin_products(query)
+    elif data == "cancel_action":
+        context.user_data.clear()
+        await edit(query, "❌ <b>Action cancelled.</b>", main_menu(uid))
+
+    # ─── Admin ───
+    elif data == "admin":
+        await show_admin(query)
+    elif data == "admin_dashboard":
+        await show_admin_dashboard(query)
+    elif data == "admin_users":
+        await show_admin_users(query)
+    elif data == "admin_orders":
+        await show_admin_orders(query)
+    elif data == "admin_report":
+        await show_admin_report(query)
+    elif data == "export_orders":
+        await export_orders(query, context)
+    elif data == "admin_search":
+        context.user_data["state"] = "await_search"
+        await edit(query, "🔎 <b>Find User</b>\n\nSend Telegram ID or @username:", kb([cancel_row()]))
+    elif data.startswith("ban_toggle:"):
+        await toggle_ban(query, context, int(data.split(":")[1]))
+    elif data == "admin_products":
+        await show_admin_products(query)
+    elif data == "admin_add_product":
+        context.user_data["state"] = "await_prod_name"
+        await edit(query, "➕ <b>Add New Product</b>\n\n<b>Step 1/5:</b> Send the product name / title.\n"
+                          "You can use many emojis, e.g. <code>👑🔥 VIP PREMIUM 🔥👑</code>", kb([cancel_row()]))
+    elif data.startswith("toggle_prod:"):
+        pid = int(data.split(":")[1])
+        p = db.get_product(pid)
+        if p:
+            new = "inactive" if p["status"] == "active" else "active"
+            db.set_product_status(pid, new)
+            db.log_admin(uid, f"product {pid} -> {new}")
+        await show_admin_products(query)
+    elif data.startswith("edit_prod:"):
+        await show_edit_product(query, int(data.split(":")[1]))
+    elif data.startswith("edit_plan:"):
+        await show_plan_menu(query, int(data.split(":")[1]))
+    elif data.startswith("del_prod:"):
+        pid = int(data.split(":")[1])
+        p = db.get_product(pid)
+        name = esc(p["name"]) if p else "this product"
+        await edit(query, f"🗑️ Delete <b>{name}</b>?\nThis cannot be undone.",
+                   kb([[btn("🗑️ Yes, delete", f"del_ok:{pid}", "danger")],
+                       [btn("⬅️ No, go back", "admin_products")]]))
+    elif data.startswith("del_ok:"):
+        pid = int(data.split(":")[1])
+        db.delete_product(pid)
+        db.log_admin(uid, f"deleted product {pid}")
+        await show_admin_products(query)
+    elif data == "admin_coupons":
+        await show_admin_coupons(query)
+    elif data == "admin_add_coupon":
+        context.user_data["state"] = "await_coupon_code"
+        await edit(query,
+                   "🎁 <b>Add Coupon</b>\n\nFormat: <code>CODE TYPE VALUE DAYS LIMIT</code>\n"
+                   "Types: <code>BALANCE</code> (adds wallet money), <code>PERCENT</code> / <code>FLAT</code> (discount on next purchase)\n"
+                   "DAYS = 0 for no expiry. LIMIT = total uses.\n\n"
+                   "<code>SAVE10 PERCENT 10 30 100</code>\n<code>WELCOME BALANCE 50 7 20</code>",
+                   kb([cancel_row()]))
+    elif data == "admin_broadcast":
+        context.user_data["state"] = "await_broadcast"
+        await edit(query, "📢 <b>Broadcast</b>\n\nSend the message for all users (bold/italic formatting works):",
+                   kb([cancel_row()]))
+    elif data == "admin_add_balance":
+        context.user_data["state"] = "await_admin_user_id"
+        context.user_data["bal_mode"] = "add"
+        await edit(query, head("➕", "Add Balance") + "Send user Telegram ID:", kb([cancel_row()]))
+    elif data == "admin_deduct":
+        context.user_data["state"] = "await_admin_user_id"
+        context.user_data["bal_mode"] = "deduct"
+        await edit(query, head("➖", "Deduct Balance") + "Send user Telegram ID:", kb([cancel_row()]))
+    elif data == "admin_maint":
+        new = "0" if db.get_setting("maintenance") == "1" else "1"
+        db.set_setting("maintenance", new)
+        db.log_admin(uid, f"maintenance -> {new}")
+        await show_admin(query)
+    elif data == "admin_top":
+        await show_admin_top(query)
+    elif data == "admin_banned":
+        await show_admin_banned(query)
+    elif data == "admin_logs":
+        await show_admin_logs(query)
+    elif data == "admin_backup":
+        await send_backup(query, context)
+    elif data == "admin_welcome":
+        context.user_data["state"] = "await_welcome"
+        await edit(query,
+                   head("📝", "Welcome Message") +
+                   "Send the new welcome text (bold/italic formatting works).\n"
+                   "Send <code>-</code> to reset to the default message.",
+                   kb([cancel_row()]))
+    elif data.startswith("add_plan:"):
+        context.user_data["state"] = "await_new_plan"
+        context.user_data["plan_product_id"] = int(data.split(":")[1])
+        await edit(query,
+                   head("➕", "Add Plan") +
+                   "Send plan in this format:\n<code>Name = Price</code>\n\nExample: <code>2 Days = 500</code>\n"
+                   "Plan name must contain hours or days.",
+                   kb([cancel_row()]))
+    elif data.startswith("del_plan:"):
+        plan = db.get_plan(int(data.split(":")[1]))
+        if plan:
+            pid = plan["product_id"]
+            db.delete_plan(plan["id"])
+            db.log_admin(uid, f"deleted plan {plan['id']} ({plan['plan_name']})")
+            await show_edit_product(query, pid)
+    elif data.startswith("del_coupon:"):
+        db.delete_coupon(int(data.split(":")[1]))
+        db.log_admin(uid, f"deleted coupon {data.split(':')[1]}")
+        await show_admin_coupons(query)
+
+    # ─── Admin: settings (UPI ID, store name, support, limits) ───
+    elif data == "admin_settings":
+        await show_admin_settings(query)
+    elif data.startswith("admin_set:"):
+        key = data.split(":", 1)[1]
+        if key in SETTING_DEFS:
+            context.user_data["state"] = "await_setting"
+            context.user_data["setting_key"] = key
+            await edit(query, setting_prompt(key), kb([cancel_row()]))
+
+    # ─── Admin: media (welcome screen / product / demo) ───
+    elif data.startswith("admin_mm:"):
+        await show_media_manager(query, data.split(":", 1)[1])
+    elif data.startswith("admin_madd:"):
+        owner = data.split(":", 1)[1]
+        if db.count_media(owner) >= MAX_MEDIA_PER_ITEM:
+            await edit(query, f"❌ Maximum {MAX_MEDIA_PER_ITEM} files reached. Clear some first.",
+                       kb([[btn("⬅️ Back", f"admin_mm:{owner}", "primary")]]))
+        else:
+            context.user_data["state"] = "await_media"
+            context.user_data["media_owner"] = owner
+            await edit(query,
+                       head("🖼", "Add Photos / Videos") +
+                       "Send photos or videos now - one by one or as an album.\n"
+                       "Send them as normal photo/video (not as a file).\n\nTap <b>Done</b> when finished.",
+                       kb([[btn("✅ Done", f"admin_mm:{owner}", "success")]]))
+    elif data.startswith("admin_mview:"):
+        await preview_media(query, context, data.split(":", 1)[1])
+    elif data.startswith("admin_mclear:"):
+        owner = data.split(":", 1)[1]
+        db.clear_media(owner)
+        db.log_admin(uid, f"cleared media {owner}")
+        await show_media_manager(query, owner)
+
+    # ─── Admin: product fields / delivery / plans ───
+    elif data.startswith("admin_pf:"):
+        _, pid_s, field = data.split(":")
+        p = db.get_product(int(pid_s))
+        if p and field in PROD_FIELDS:
+            context.user_data["state"] = "await_prod_field"
+            context.user_data["prod_edit_id"] = p["id"]
+            context.user_data["prod_edit_field"] = field
+            await edit(query, prod_field_prompt(p, field), kb([cancel_row()]))
+    elif data.startswith("admin_api:"):
+        pid = int(data.split(":")[1])
+        p = db.get_product(pid)
+        if p:
+            db.set_product_api(pid, 0 if p["use_api"] else 1)
+            db.log_admin(uid, f"product {pid} delivery -> {'vip link' if p['use_api'] else 'api key'}")
+            await show_edit_product(query, pid)
+    elif data.startswith("admin_plan_price:"):
+        plan = db.get_plan(int(data.split(":")[1]))
+        if plan:
+            context.user_data["state"] = "await_plan_price"
+            context.user_data["edit_plan_id"] = plan["id"]
+            await edit(query, f"💰 <b>{esc(plan['plan_name'])}</b>\nCurrent price: {fmt_money(plan['price'])}\n\n"
+                              f"Send the new price:", kb([cancel_row()]))
+    elif data.startswith("admin_plan_name:"):
+        plan = db.get_plan(int(data.split(":")[1]))
+        if plan:
+            context.user_data["state"] = "await_plan_name"
+            context.user_data["plan_edit_id"] = plan["id"]
+            await edit(query,
+                       f"⏱ <b>{esc(plan['plan_name'])}</b>\n\nSend the new plan name with its duration, e.g.\n"
+                       f"<code>7 Days</code>  <code>30 Days</code>  <code>1 Month</code>  <code>Lifetime</code>\n\n"
+                       f"The duration in the name decides how long the VIP stays.", kb([cancel_row()]))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STORE
+# ═══════════════════════════════════════════════════════════════════
+
+async def show_product(query, context, product_id: int):
+    product = db.get_product(product_id)
+    if not product or product["status"] != "active":
+        await edit(query, "❌ Product not available.", back_btn("main"))
+        return
+    plans = db.get_product_plans(product_id)
+    if not plans:
+        await edit(query, "No plans available.", back_btn("main"))
+        return
+    text = f"<b>{esc(product['name'])}</b>\n\n"
+    if product.get("description"):
+        text += f"{esc(product['description'])}\n\n"
+    text += "<b>Available Plans:</b>"
+    rows = [[btn(f"🛒 {p['plan_name']} - {fmt_money(p['price'])}", f"buy:{product_id}:{p['id']}", "success")]
+            for p in plans]
+    if product.get("demo_link"):
+        rows.append([btn(product.get("demo_title") or "🎬 Demo Channel", url=product["demo_link"], style="primary")])
+    if db.count_media(f"p{product_id}:demo"):
+        rows.append([btn("📸 Demo Photos / Videos", f"demo:{product_id}", "primary")])
+    rows.append([btn("⬅️ Back", "back:main")])
+
+    media = db.get_media(f"p{product_id}:main")
+    if media:
+        chat_id = query.message.chat_id
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await send_media(context.bot, chat_id, media)
+        await context.bot.send_message(chat_id, text, reply_markup=kb(rows), parse_mode="HTML")
+    else:
+        await edit(query, text, kb(rows))
+
+
+async def show_demo(query, context, product_id: int):
+    product = db.get_product(product_id)
+    media = db.get_media(f"p{product_id}:demo")
+    if not product or product["status"] != "active" or not media:
+        await edit(query, "❌ No demo available.", back_btn("main"))
+        return
+    rows = []
+    if product.get("demo_link"):
+        rows.append([btn(product.get("demo_title") or "🎬 Demo Channel", url=product["demo_link"], style="primary")])
+    rows.append([btn("⬅️ Back", f"prod:{product_id}", "primary")])
+    chat_id = query.message.chat_id
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await send_media(context.bot, chat_id, media)
+    await context.bot.send_message(chat_id, f"🎬 <b>Demo - {esc(product['name'])}</b>",
+                                   reply_markup=kb(rows), parse_mode="HTML")
+
+
+def price_with_coupon(user: Dict, price: float):
+    """Returns (final_price, discount, coupon_code)."""
+    code = user.get("active_coupon")
+    if not code:
+        return price, 0.0, None
+    c = db.get_coupon(code)
+    if not c:
+        return price, 0.0, None
+    if c["type"] == "PERCENT":
+        discount = price * float(c["value"]) / 100
+    elif c["type"] == "FLAT":
+        discount = float(c["value"])
+    else:
+        return price, 0.0, None
+    final = max(round(price - discount, 2), 1.0)
+    return final, round(price - final, 2), code
+
+
+def order_summary(product, plan, price, discount, code, balance, android_id=None) -> str:
+    text = (f"📦 <b>ORDER SUMMARY</b>\n\n🎮 Product: <b>{esc(product['name'])}</b>\n"
+            f"📋 Plan: <b>{esc(plan['plan_name'])}</b>\n")
+    dur = fmt_duration(plan.get("api_hours"))
+    if dur:
+        text += f"⏳ Validity: <b>{dur}</b>\n"
+    if android_id:
+        text += f"📱 Android ID: <code>{esc(android_id)}</code>\n"
+    if discount > 0:
+        text += (f"🏷️ Coupon <b>{esc(code)}</b>: -{fmt_money(discount)}\n"
+                 f"💵 Original: <s>{fmt_money(plan['price'])}</s>\n")
+    text += (f"💰 Price: <b>{fmt_money(price)}</b>\n"
+             f"💳 Balance After: <b>{fmt_money(balance - price)}</b>\n\nDo you want to confirm?")
+    return text
+
+
+async def initiate_purchase(query, context, user, product_id: int, plan_id: int):
+    product = db.get_product(product_id)
+    plan = db.get_plan(plan_id)
+    if not product or not plan or plan["product_id"] != product_id or product["status"] != "active":
+        await edit(query, "❌ Invalid product or plan.", back_btn("store"))
+        return
+
+    price, discount, code = price_with_coupon(user, float(plan["price"]))
+    balance = float(user["balance"])
+
+    if balance < price - 0.001:
+        await edit(query,
+                   f"❌ <b>Insufficient Balance!</b>\n\n💰 Required: <b>{fmt_money(price)}</b>\n"
+                   f"💳 Your Balance: <b>{fmt_money(balance)}</b>\n\nPlease add balance first.",
+                   kb([[btn("💳 Add Balance", "add_balance", "success")],
+                       [btn("⬅️ Back", f"prod:{product_id}")]]))
+        return
+
+    if product["use_api"] and product["api_version"] == "v1":
+        context.user_data["pending_purchase"] = {"product_id": product_id, "plan_id": plan_id}
+        context.user_data["state"] = "await_android_id"
+        await edit(query,
+                   f"📱 <b>{esc(product['name'])}</b> - {esc(plan['plan_name'])}\n\n"
+                   f"This product needs your Android ID.\nPlease send it now:",
+                   kb([cancel_row()]))
+        return
+
+    await edit(query, order_summary(product, plan, price, discount, code, balance),
+               kb([[btn("✅ Confirm Order", f"confirm_buy:{product_id}:{plan_id}", "success")],
+                   [btn("❌ Cancel", f"prod:{product_id}", "danger")]]))
+
+
+async def process_purchase(query, context, tg_id: int, product_id: int, plan_id: int):
+    lock = user_lock(tg_id)
+    if lock.locked():
+        return  # double tap: first request is still running
+    async with lock:
+        user = db.get_user(tg_id)
+        product = db.get_product(product_id)
+        plan = db.get_plan(plan_id)
+        android_id = context.user_data.pop("android_id", None)
+
+        if not user or user["banned"] and not is_admin(tg_id):
+            return
+        if not product or not plan or plan["product_id"] != product_id or product["status"] != "active":
+            await edit(query, "❌ Product/Plan not available.", back_btn("main"))
+            return
+
+        use_api = bool(product["use_api"])
+        hours = plan.get("api_hours")
+        if hours is None:
+            hours = guess_hours(plan["plan_name"])
+        if use_api and not hours:
+            await edit(query, f"❌ This plan is not configured correctly. Contact {esc(SUPPORT_USERNAME)}.",
+                       back_btn("main"))
+            await notify_admins(context.bot, f"⚠️ Plan <b>{esc(plan['plan_name'])}</b> of "
+                                              f"<b>{esc(product['name'])}</b> has no valid duration (hours).")
+            return
+        if not use_api and not product.get("vip_link"):
+            await edit(query, f"❌ This product is not ready yet. Contact {esc(SUPPORT_USERNAME)}.",
+                       back_btn("main"))
+            await notify_admins(context.bot, f"⚠️ Product <b>{esc(product['name'])}</b> has no VIP link set - "
+                                              f"a user tried to buy it. Set it in Admin → Products.")
+            return
+        if use_api and product["api_version"] == "v1" and not android_id:
+            await edit(query, "❌ Android ID missing. Please start the purchase again.", back_btn("main"))
+            return
+
+        price, discount, code = price_with_coupon(user, float(plan["price"]))
+
+        if not db.deduct_balance(tg_id, price):
+            await edit(query, "❌ <b>Insufficient balance.</b>",
+                       kb([[btn("💳 Add Balance", "add_balance", "success")], [btn("⬅️ Back", "back:main")]]))
+            return
+
+        await edit(query, "⏳ <b>Processing your order...</b> Please wait.")
+
+        # ── key products: get the key from the API; refund only if THIS part fails ──
+        key_code = None
+        api_data: Dict[str, Any] = {}
+        if use_api:
+            error = None
+            try:
+                api_data = await generate_key_via_api(hours, product.get("api_version", "v2"), android_id)
+                error = api_error(api_data)
+                if not error:
+                    key_code = extract_key(api_data)
+                    if not key_code:
+                        error = "No key received from API"
+            except Exception as e:
+                error = str(e)
+
+            if error:
+                logger.error(f"Purchase failed for {tg_id}: {error}")
+                db.update_balance(tg_id, price)
+                await edit(query,
+                           f"❌ <b>Order Failed</b>\n\nSomething went wrong while creating your key.\n"
+                           f"💰 Your balance has been <b>refunded</b>.\n\nPlease try again later or contact "
+                           f"{esc(SUPPORT_USERNAME)}",
+                           back_btn("main"))
+                await notify_admins(context.bot,
+                                    f"⚠️ <b>ORDER FAILED</b> (refunded)\n\nUser: {uname(user)} (<code>{tg_id}</code>)\n"
+                                    f"Product: {esc(product['name'])} / {esc(plan['plan_name'])}\n"
+                                    f"Error: <code>{esc(error)}</code>")
+                return
+
+        # ── delivered: from here we NEVER refund ──
+        order_id = generate_order_id()
+        vip_link = product.get("vip_link")
+        expires_at = utc_now_str(hours) if hours else None
+        try:
+            db.create_order(order_id, user["id"], product_id, plan_id, plan["plan_name"], price,
+                            key_code, android_id, json.dumps(api_data) if api_data else None,
+                            vip_link, expires_at)
+            db.increment_orders(tg_id)
+            if code:
+                db.set_active_coupon(tg_id, None)
+        except Exception as e:
+            logger.error(f"Order save failed (order was delivered): {e}")
+
+        try:
+            if user["referred_by"]:
+                ref = db.get_user_by_id(user["referred_by"])
+                if ref and REFERRAL_PERCENT > 0:
+                    commission = round(price * REFERRAL_PERCENT / 100, 2)
+                    db.credit_referral(ref["telegram_id"], commission)
+                    try:
+                        await context.bot.send_message(
+                            ref["telegram_id"],
+                            f"🎁 <b>Referral bonus!</b> +{fmt_money(commission)} added to your wallet.",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Referral error: {e}")
+
+        text = (f"✅ <b>ORDER COMPLETED</b>\n\n🎮 Product: <b>{esc(product['name'])}</b>\n"
+                f"📋 Plan: <b>{esc(plan['plan_name'])}</b>\n💰 Paid: <b>{fmt_money(price)}</b>\n"
+                f"🆔 Order ID: <code>#{order_id}</code>\n")
+        if expires_at:
+            text += f"⏳ Valid till: <b>{fmt_time(expires_at)}</b>\n"
+        elif hours == 0:
+            text += "⏳ Validity: <b>Lifetime</b>\n"
+        if key_code:
+            text += f"\n🔑 <b>YOUR KEY:</b>\n<code>{esc(key_code)}</code>\n"
+        rows = []
+        if vip_link:
+            title = product.get("vip_title") or "👑 Join VIP Channel"
+            text += f"\n👑 <b>{esc(title)}</b>\n{esc(vip_link)}\n"
+            rows.append([btn(title, url=vip_link, style="success")])
+        text += f"\n📞 Support: {esc(SUPPORT_USERNAME)}\n🚀 Thank you for purchasing from <b>{esc(STORE_NAME)}</b>!"
+        rows.append([btn("🏠 Main Menu", "back:main", "primary")])
+        try:
+            await edit(query, text, kb(rows))
+        except Exception:
+            await context.bot.send_message(tg_id, text, reply_markup=kb(rows), parse_mode="HTML")
+
+        await notify_admins(context.bot,
+                            f"💰 <b>NEW SALE!</b>\n\n🎮 {esc(product['name'])} - {esc(plan['plan_name'])}\n"
+                            f"💰 {fmt_money(price)}\n👤 {uname(user)}\n🆔 <code>{tg_id}</code>")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WALLET
+# ═══════════════════════════════════════════════════════════════════
+
+async def show_wallet(query, user):
+    await edit(query,
+               f"💰 <b>Wallet</b>\n\nCurrent Balance: <b>{fmt_money(user['balance'])}</b>\n\nSelect an option:",
+               kb([[btn("💳 Add Balance", "add_balance", "success")],
+                   [btn("📜 Transaction History", "wallet_history")],
+                   [btn("🎁 Redeem Coupon", "redeem_coupon")],
+                   [btn("⬅️ Back", "back:main")]]))
+
+
+async def show_wallet_history(query, user):
+    txs = db.get_user_transactions(user["id"], 10)
+    if not txs:
+        await edit(query, "📜 No transactions yet.", back_btn("wallet"))
+        return
+    icons = {"approved": "✅", "pending": "⏳", "rejected": "❌", "expired": "⌛", "duplicate": "⚠️"}
+    text = "📜 <b>Last Transactions</b>\n\n"
+    for t in txs:
+        text += (f"{icons.get(t['status'], '•')} <b>{fmt_money(t['amount'])}</b> - {esc(t['status'].title())}\n"
+                 f"   🕐 {fmt_time(t['created_at'])}\n")
+        if t.get("utr"):
+            text += f"   🔢 <code>{esc(t['utr'])}</code>\n"
+        text += "\n"
+    await edit(query, text, back_btn("wallet"))
+
+
+async def ask_amount(query):
+    await edit(query, f"💳 <b>Add Balance</b>\n\nSelect amount (minimum {fmt_money(MIN_RECHARGE)}):",
+               kb([[btn("₹50", "amount:50", "success"), btn("₹100", "amount:100", "success"),
+                    btn("₹200", "amount:200", "success")],
+                   [btn("₹500", "amount:500", "success"), btn("₹1000", "amount:1000", "success"),
+                    btn("✍️ Custom", "amount:custom", "primary")],
+                   [btn("⬅️ Back", "back:wallet")]]))
+
+
+async def send_payment_details(context, chat_id: int, amount: float, user: Dict, query=None):
+    """Shows UPI QR. After paying, the user sends the UTR and the bot verifies it."""
+    if db.count_open_payments(user["id"], 30) >= 5:
+        text = "⚠️ You have too many unfinished payments. Complete one or wait a few minutes."
+        if query:
+            await edit(query, text, back_btn("wallet"))
+        else:
+            await context.bot.send_message(chat_id, text, reply_markup=main_menu(user["telegram_id"]))
+        return
+    ref = "TX" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    tx_id = db.create_payment_tx(user["id"], amount, ref, amount, chat_id)
+    caption = (f"💳 <b>Payment Details</b>\n\nAmount: <b>{fmt_money(amount)}</b>\n"
+               f"UPI ID: <code>{esc(UPI_ID)}</code>\n🧾 Ref: <code>{ref}</code>\n\n✅ <b>Steps:</b>\n"
+               f"1. Scan the QR or pay to the UPI ID\n"
+               f"2. Pay the <b>exact amount</b> shown\n"
+               f"3. Tap <b>I Paid</b> and send the 12-digit UTR\n\n"
+               f"⚡ Balance is added instantly after verification.")
+    markup = kb([[btn("✅ I Paid - Enter UTR", f"utr_verify:{tx_id}", "success")], cancel_row()])
+    if query:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+    try:
+        sent = await context.bot.send_photo(
+            chat_id, InputFile(generate_upi_qr(amount), filename="payment_qr.png"),
+            caption=caption, reply_markup=markup, parse_mode="HTML")
+        db.set_tx_message(tx_id, sent.message_id)
+    except Exception as e:
+        logger.error(f"Could not send payment screen: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PROFILE / ORDERS
+# ═══════════════════════════════════════════════════════════════════
+
+async def show_profile(query, user, bot_username: str):
+    text = (f"👤 <b>Profile</b>\n\n🆔 User ID: <code>{user['telegram_id']}</code>\n"
+            f"👤 Username: {uname(user)}\n💰 Balance: <b>{fmt_money(user['balance'])}</b>\n"
+            f"📦 Total Orders: <b>{user['total_orders']}</b>\n"
+            f"🎁 Referral Earnings: <b>{fmt_money(user['referral_earnings'])}</b>\n"
+            f"📅 Joined: {fmt_time(user['created_at'], '%d %b %Y')}\n")
+    if user.get("active_coupon"):
+        text += f"🏷️ Active coupon: <b>{esc(user['active_coupon'])}</b> (applies to next purchase)\n"
+    text += f"\n🔗 Referral Code: <code>{esc(user['referral_code'])}</code>"
+    await edit(query, text,
+               kb([[btn("➕ Add Balance", "add_balance", "success")],
+                   [btn("📦 Order History", "orders"), btn("🔗 Referral", "referral")],
+                   [btn("🎁 Redeem Coupon", "redeem_coupon")],
+                   [btn("⬅️ Back", "back:main")]]))
+
+
+async def show_orders(query, user):
+    orders = db.get_user_orders(user["id"], 10)
+    if not orders:
+        await edit(query, "📦 You have no orders yet.",
+                   kb([[btn("🛒 Products", "store", "primary")], [btn("⬅️ Back", "back:main")]]))
+        return
+    text = "📦 <b>My Orders</b> (last 10)\n\n"
+    for o in orders:
+        if len(text) > 3300:   # keep the message under Telegram's 4096 limit
+            break
+        text += (f"🆔 <code>#{o['order_id']}</code> | <b>{esc(o['product_name'])}</b>\n"
+                 f"   📋 {esc(o['plan_name'])} | {fmt_money(o['price'])}\n"
+                 f"   📅 {fmt_time(o['created_at'])}\n")
+        if o.get("key_code"):
+            text += f"   🔑 <code>{esc(o['key_code'])}</code>\n"
+        if o.get("vip_link"):
+            text += f"   👑 {esc(o['vip_link'])}\n"
+        if o.get("expires_at"):
+            gone = str(o["expires_at"]) < utc_now_str()
+            text += f"   {'⌛ Expired' if gone else '⏳ Valid till'}: {fmt_time(o['expires_at'])}\n"
+        text += "\n"
+    await edit(query, text, back_btn("profile"))
+
+
+async def show_referral(query, user, bot_username: str):
+    await edit(query,
+               f"🎁 <b>Referral Program</b>\n\nInvite friends and earn <b>{REFERRAL_PERCENT:g}% commission</b> "
+               f"in your wallet on every purchase they make!\n\n🔗 Your Link:\n"
+               f"<code>https://t.me/{bot_username}?start=ref_{user['referral_code']}</code>\n\n"
+               f"💰 Total Earnings: <b>{fmt_money(user['referral_earnings'])}</b>",
+               back_btn("profile"))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ADMIN PANEL
+# ═══════════════════════════════════════════════════════════════════
+
+async def show_admin(query):
+    pending = len(db.get_pending_transactions())
+    maint = db.get_setting("maintenance") == "1"
+    maint_label = "🔧 Maintenance: ON" if maint else "🔧 Maintenance: OFF"
+    await edit(query,
+               head("⚙️", "Admin Panel") +
+               f"Pending payments: <b>{pending}</b>\nMaintenance: <b>{'ON 🔴' if maint else 'OFF 🟢'}</b>",
+               kb([[btn("📊 Dashboard", "admin_dashboard", "primary"), btn("📈 Sales Report", "admin_report", "primary")],
+                   [btn("👥 Users", "admin_users", "primary"), btn("📦 Orders", "admin_orders", "primary")],
+                   [btn("🛍️ Products", "admin_products", "primary"), btn("🎁 Coupons", "admin_coupons", "primary")],
+                   [btn("🏆 Top Stats", "admin_top", "primary"), btn("🔎 Find / Ban User", "admin_search", "danger")],
+                   [btn("➕ Add Balance", "admin_add_balance", "success"), btn("➖ Deduct Balance", "admin_deduct", "danger")],
+                   [btn("📢 Broadcast", "admin_broadcast", "primary"), btn("📝 Welcome Text", "admin_welcome", "primary")],
+                   [btn("🖼 Welcome Photos/Videos", "admin_mm:welcome", "primary"),
+                    btn("⚙️ Settings / UPI", "admin_settings", "success")],
+                   [btn("🚫 Banned Users", "admin_banned", "danger"), btn("📜 Admin Logs", "admin_logs", "primary")],
+                   [btn("💾 Backup DB", "admin_backup", "success"),
+                    btn(maint_label, "admin_maint", "danger" if maint else "success")],
+                   [btn("⬅️ Back", "back:main", "primary")]]))
+
+
+async def show_admin_dashboard(query):
+    t_cnt, t_sum = db.sales_today()
+    pending = db.get_pending_transactions()
+    await edit(query,
+               head("📊", "Dashboard") +
+               f"👥 Total Users: <b>{db.count_users()}</b> (+{db.new_users_today()} today)\n"
+               f"📦 Total Orders: <b>{db.count_orders()}</b>\n"
+               f"📈 Today: <b>{fmt_money(t_sum)}</b> ({t_cnt} orders)\n"
+               f"💳 Pending Payments: <b>{len(pending)}</b> ({fmt_money(db.get_total_pending_amount())})\n"
+               f"👛 Users' Wallet Total: <b>{fmt_money(db.total_wallet_balance())}</b>",
+               back_btn("admin"))
+
+
+async def show_admin_top(query):
+    text = head("🏆", "Top Stats")
+    text += "\n💎 <b>Top Buyers</b>\n"
+    buyers = db.get_top_buyers(5)
+    for i, b in enumerate(buyers, 1):
+        text += f"{i}. {uname(b)} (<code>{b['telegram_id']}</code>) - {fmt_money(b['spent'])} / {b['cnt']} orders\n"
+    if not buyers:
+        text += "No purchases yet.\n"
+    text += f"\n{DIV}\n🔥 <b>Best Selling Products</b>\n"
+    prods = db.get_top_products(5)
+    for i, p in enumerate(prods, 1):
+        text += f"{i}. {esc(p['name'])} - {p['cnt']} sold / {fmt_money(p['total'])}\n"
+    if not prods:
+        text += "No sales yet.\n"
+    refs = db.get_top_referrers(5)
+    text += f"\n{DIV}\n🎁 <b>Top Referrers</b>\n"
+    for i, r in enumerate(refs, 1):
+        text += f"{i}. {uname(r)} - {r['refs']} invites / {fmt_money(r['referral_earnings'])}\n"
+    if not refs:
+        text += "No referrals yet.\n"
+    await edit(query, text, back_btn("admin"))
+
+
+async def show_admin_banned(query):
+    users = db.get_banned_users()
+    text = head("🚫", "Banned Users")
+    if not users:
+        text += "No banned users."
+        await edit(query, text, back_btn("admin"))
+        return
+    rows = []
+    for u in users:
+        text += f"🆔 <code>{u['telegram_id']}</code> | {uname(u)}\n"
+        rows.append([btn(f"✅ Unban {u['telegram_id']}", f"ban_toggle:{u['telegram_id']}", "success")])
+    rows.append([btn("⬅️ Back", "back:admin", "primary")])
+    await edit(query, text, kb(rows))
+
+
+async def show_admin_logs(query):
+    logs = db.get_logs(15)
+    text = head("📜", "Admin Logs")
+    if not logs:
+        text += "No actions logged yet."
+    for l in logs:
+        text += f"🕐 {fmt_time(l['created_at'], '%d %b %H:%M')} | <code>{l['admin_id']}</code>\n   {esc(l['action'])}\n"
+    await edit(query, text, back_btn("admin"))
+
+
+async def send_backup(query, context):
+    path = os.path.join(BASE_DIR, f"backup_{datetime.now():%Y%m%d_%H%M%S}.db")
+    try:
+        db.backup_to(path)
+        with open(path, "rb") as f:
+            await context.bot.send_document(
+                query.message.chat_id, InputFile(f, filename=os.path.basename(path)),
+                caption="💾 Database backup")
+        db.log_admin(query.from_user.id, "downloaded DB backup")
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        await context.bot.send_message(query.message.chat_id, "❌ Backup failed. Check the server logs.")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def show_admin_report(query):
+    t_cnt, t_sum = db.sales_today()
+    w_cnt, w_sum = db.sales_last_days(7)
+    m_cnt, m_sum = db.sales_last_days(30)
+    await edit(query,
+               f"📈 <b>Sales Report</b>\n\n📅 Today: <b>{fmt_money(t_sum)}</b> ({t_cnt} orders)\n"
+               f"🗓️ Last 7 days: <b>{fmt_money(w_sum)}</b> ({w_cnt} orders)\n"
+               f"🗓️ Last 30 days: <b>{fmt_money(m_sum)}</b> ({m_cnt} orders)",
+               kb([[btn("📄 Export Orders CSV", "export_orders", "primary")], [btn("⬅️ Back", "back:admin")]]))
+
+
+async def export_orders(query, context):
+    orders = db.get_all_orders(100000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["order_id", "date", "product", "plan", "price", "username", "telegram_id", "key"])
+    for o in orders:
+        w.writerow([o["order_id"], fmt_time(o["created_at"]), o["product_name"], o["plan_name"],
+                    o["price"], o.get("username") or "", o["telegram_id"], o.get("key_code") or ""])
+    data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    await context.bot.send_document(
+        query.message.chat_id, InputFile(data, filename=f"orders_{datetime.now():%Y%m%d}.csv"),
+        caption=f"📄 {len(orders)} orders")
+    db.log_admin(query.from_user.id, "exported orders CSV")
+
+
+async def show_admin_users(query):
+    text = "👥 <b>Recent Users</b>\n\n"
+    for u in db.get_all_users(limit=20):
+        flag = "🚫 " if u["banned"] else ""
+        text += (f"{flag}🆔 <code>{u['telegram_id']}</code> | {uname(u)}\n"
+                 f"   💰 {fmt_money(u['balance'])} | 📦 {u['total_orders']} orders\n\n")
+    await edit(query, text, back_btn("admin"))
+
+
+async def show_admin_orders(query):
+    text = "📦 <b>Recent Orders</b>\n\n"
+    for o in db.get_all_orders(limit=15):
+        text += (f"🆔 <code>#{o['order_id']}</code> | {esc(o['product_name'])}\n"
+                 f"   👤 {uname(o)} | 💰 {fmt_money(o['price'])} | {fmt_time(o['created_at'], '%d %b %H:%M')}\n\n")
+    await edit(query, text, back_btn("admin"))
+
+
+def user_card(u: Dict) -> str:
+    return (f"👤 <b>User</b>\n\n🆔 <code>{u['telegram_id']}</code>\n👤 {uname(u)}\n"
+            f"💰 Balance: <b>{fmt_money(u['balance'])}</b>\n📦 Orders: <b>{u['total_orders']}</b>\n"
+            f"📅 Joined: {fmt_time(u['created_at'], '%d %b %Y')}\n"
+            f"Status: {'🚫 <b>BANNED</b>' if u['banned'] else '✅ Active'}")
+
+
+async def toggle_ban(query, context, tg_id: int):
+    u = db.get_user(tg_id)
+    if not u:
+        await edit(query, "❌ User not found.", back_btn("admin"))
+        return
+    if is_admin(tg_id):
+        await edit(query, "❌ You can't ban an admin.", back_btn("admin"))
+        return
+    new_state = not u["banned"]
+    db.set_banned(tg_id, new_state)
+    db.log_admin(query.from_user.id, f"{'banned' if new_state else 'unbanned'} user {tg_id}")
+    u["banned"] = int(new_state)
+    await edit(query, user_card(u),
+               kb([[btn("✅ Unban" if new_state else "🚫 Ban", f"ban_toggle:{tg_id}",
+                        "success" if new_state else "danger")],
+                   [btn("⬅️ Back", "back:admin")]]))
+
+
+async def show_admin_products(query):
+    products = db.get_products(include_inactive=True)
+    text = "🛍️ <b>Products</b>\n\n"
+    rows = []
+    for p in products:
+        on = p["status"] == "active"
+        text += f"{'🟢' if on else '🔴'} <b>{esc(p['name'])}</b> {'🔑' if p['use_api'] else '👑'}\n"
+        rows.append([btn(f"✏️ {p['name'][:16]}", f"edit_prod:{p['id']}", "primary"),
+                     btn("🙈 Hide" if on else "👁 Show", f"toggle_prod:{p['id']}"),
+                     btn("🗑️", f"del_prod:{p['id']}", "danger")])
+    rows.append([btn("➕ Add Product", "admin_add_product", "success")])
+    rows.append([btn("⬅️ Back", "back:admin")])
+    await edit(query, text, kb(rows))
+
+
+PROD_FIELDS = {   # field: (button label, db column, optional?)
+    "name": ("✏️ Name / Title", "name", False),
+    "desc": ("📝 Description", "description", True),
+    "vip_link": ("👑 VIP Channel Link", "vip_link", True),
+    "vip_title": ("🏷 VIP Button Title", "vip_title", True),
+    "demo_link": ("🎬 Demo Channel Link", "demo_link", True),
+    "demo_title": ("🏷 Demo Button Title", "demo_title", True),
+}
+LINK_FIELDS = ("vip_link", "demo_link")
+
+
+def edit_product_view(product_id: int):
+    """-> (text, keyboard) of the product edit screen."""
+    p = db.get_product(product_id)
+    if not p:
+        return "❌ Product not found.", back_btn("admin_products")
+    on = p["status"] == "active"
+    n_main = db.count_media(f"p{product_id}:main")
+    n_demo = db.count_media(f"p{product_id}:demo")
+    vip = esc(p["vip_link"]) if p.get("vip_link") else "<i>not set</i>"
+    demo = esc(p["demo_link"]) if p.get("demo_link") else "<i>not set</i>"
+    text = (head("✏️", esc(p["name"])) +
+            f"Status: <b>{'🟢 Visible' if on else '🔴 Hidden'}</b>\n"
+            f"Delivery: <b>{'🔑 API Key' if p['use_api'] else '👑 VIP Link'}</b>\n"
+            f"👑 VIP link: {vip}\n🎬 Demo link: {demo}\n"
+            f"🖼 Product media: <b>{n_main}</b> | 📸 Demo media: <b>{n_demo}</b>\n\n"
+            f"Tap a button to edit 👇")
+    pid = product_id
+    rows = [
+        [btn("✏️ Name / Title", f"admin_pf:{pid}:name", "primary"),
+         btn("📝 Description", f"admin_pf:{pid}:desc", "primary")],
+        [btn("👑 VIP Link", f"admin_pf:{pid}:vip_link", "success"),
+         btn("🏷 VIP Btn Title", f"admin_pf:{pid}:vip_title", "primary")],
+        [btn("🎬 Demo Link", f"admin_pf:{pid}:demo_link", "success"),
+         btn("🏷 Demo Btn Title", f"admin_pf:{pid}:demo_title", "primary")],
+        [btn(f"🖼 Product Media ({n_main})", f"admin_mm:p{pid}:main", "primary"),
+         btn(f"📸 Demo Media ({n_demo})", f"admin_mm:p{pid}:demo", "primary")],
+        [btn("🔁 Switch to VIP Link" if p["use_api"] else "🔁 Switch to API Key", f"admin_api:{pid}", "danger")],
+    ]
+    for pl in db.get_product_plans(pid):
+        rows.append([btn(f"✏️ {pl['plan_name']} - {fmt_money(pl['price'])}", f"edit_plan:{pl['id']}", "primary"),
+                     btn("🗑️", f"del_plan:{pl['id']}", "danger")])
+    rows.append([btn("➕ Add Plan", f"add_plan:{pid}", "success")])
+    rows.append([btn("⬅️ Back", "back:admin_products", "primary")])
+    return text, kb(rows)
+
+
+async def show_edit_product(query, product_id: int):
+    text, markup = edit_product_view(product_id)
+    await edit(query, text, markup)
+
+
+def prod_field_prompt(p: Dict, field: str) -> str:
+    label, col, optional = PROD_FIELDS[field]
+    cur = p.get(col)
+    shown = esc(str(cur)) if cur else "<i>not set</i>"
+    hint = {
+        "name": "Send the new name. You can use many emojis 🔥👑💎",
+        "desc": "Send the new description.",
+        "vip_link": "Send the VIP channel link, e.g. <code>https://t.me/+AbCd...</code>\nBuyers receive it after payment.",
+        "vip_title": "Send the text for the VIP link button, e.g. <code>👑 Join VIP Channel</code>",
+        "demo_link": "Send the demo channel link, e.g. <code>https://t.me/yourdemo</code>",
+        "demo_title": "Send the text for the demo button, e.g. <code>🎬 Watch Demo</code>",
+    }[field]
+    tail = "\n\nSend <code>-</code> to remove it." if optional else ""
+    return head("✏️", esc(label)) + f"Current: {shown}\n\n{hint}{tail}"
+
+
+async def show_plan_menu(query, plan_id: int):
+    plan = db.get_plan(plan_id)
+    if not plan:
+        await edit(query, "❌ Plan not found.", back_btn("admin_products"))
+        return
+    dur = fmt_duration(plan.get("api_hours")) or "not set"
+    await edit(query,
+               head("✏️", esc(plan["plan_name"])) +
+               f"💰 Price: <b>{fmt_money(plan['price'])}</b>\n⏳ Duration: <b>{dur}</b>\n\nWhat do you want to change?",
+               kb([[btn("💰 Change Price", f"admin_plan_price:{plan_id}", "success"),
+                    btn("⏱ Name / Days", f"admin_plan_name:{plan_id}", "primary")],
+                   [btn("⬅️ Back", f"edit_prod:{plan['product_id']}", "primary")]]))
+
+
+# ─── admin: settings screen ───
+def fmt_setting(key: str) -> str:
+    _label, kind, var = SETTING_DEFS[key]
+    v = globals()[var]
+    if kind == "upi":
+        return f"<code>{esc(str(v))}</code>"
+    if kind == "num":
+        return f"<b>{fmt_money(v)}</b>"
+    if kind == "pct":
+        return f"<b>{float(v):g}%</b>"
+    return f"<b>{esc(str(v))}</b>"
+
+
+def settings_view():
+    keys = list(SETTING_DEFS)
+    text = head("⚙️", "Bot Settings")
+    for k in keys:
+        text += f"{SETTING_DEFS[k][0]}: {fmt_setting(k)}\n"
+    text += "\nTap a button to change it 👇\nA new UPI ID is used for all new payments immediately."
+    rows = [[btn(SETTING_DEFS[k][0], f"admin_set:{k}", "primary") for k in keys[i:i + 2]]
+            for i in range(0, len(keys), 2)]
+    rows.append([btn("⬅️ Back", "back:admin", "primary")])
+    return text, kb(rows)
+
+
+async def show_admin_settings(query):
+    text, markup = settings_view()
+    await edit(query, text, markup)
+
+
+def setting_prompt(key: str) -> str:
+    label, kind, _var = SETTING_DEFS[key]
+    hints = {
+        "upi": "Send the new UPI ID, e.g. <code>name@bank</code>",
+        "text": "Send the new store name (max 40 characters)",
+        "user": "Send the support username, e.g. <code>@yourname</code>",
+        "num": "Send the new amount (number)",
+        "pct": "Send the percent (0 to 50)",
+    }
+    return (head("⚙️", "Change Setting") + f"{label}\nCurrent: {fmt_setting(key)}\n\n{hints[kind]}\n"
+            "Send <code>-</code> to go back to the default value.")
+
+
+# ─── admin: media manager (welcome screen / product / demo) ───
+def media_title(owner: str) -> str:
+    if owner == "welcome":
+        return "Welcome Photos / Videos"
+    m = re.match(r"p(\d+):(main|demo)$", owner)
+    if m:
+        p = db.get_product(int(m.group(1)))
+        name = esc(p["name"]) if p else "Product"
+        return f"{name} - {'Product' if m.group(2) == 'main' else 'Demo'} Media"
+    return "Media"
+
+
+def owner_back(owner: str) -> str:
+    m = re.match(r"p(\d+):", owner)
+    return f"edit_prod:{m.group(1)}" if m else "back:admin"
+
+
+def media_manager_view(owner: str):
+    items = db.get_media(owner)
+    photos = sum(1 for m in items if m["media_type"] == "photo")
+    videos = len(items) - photos
+    text = (head("🖼", media_title(owner)) +
+            f"📷 Photos: <b>{photos}</b>\n🎥 Videos: <b>{videos}</b>\n\n"
+            f"Users see these in the order you added them (max {MAX_MEDIA_PER_ITEM}).")
+    rows = [[btn("➕ Add Photos / Videos", f"admin_madd:{owner}", "success")]]
+    if items:
+        rows.append([btn("👁 Preview", f"admin_mview:{owner}", "primary"),
+                     btn("🗑 Clear All", f"admin_mclear:{owner}", "danger")])
+    rows.append([btn("⬅️ Back", owner_back(owner), "primary")])
+    return text, kb(rows)
+
+
+async def show_media_manager(query, owner: str):
+    text, markup = media_manager_view(owner)
+    await edit(query, text, markup)
+
+
+async def preview_media(query, context, owner: str):
+    items = db.get_media(owner)
+    if not items:
+        await show_media_manager(query, owner)
+        return
+    chat_id = query.message.chat_id
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await send_media(context.bot, chat_id, items)
+    text, markup = media_manager_view(owner)
+    await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+async def show_admin_coupons(query):
+    text = head("🎁", "Coupons")
+    rows = []
+    coupons = db.get_all_coupons()
+    if not coupons:
+        text += "No coupons yet."
+    for cp in coupons:
+        exp = fmt_time(cp.get("expiry_date"), "%d %b %Y") if cp.get("expiry_date") else "No expiry"
+        val = f"{cp['value']:g}%" if cp["type"] == "PERCENT" else fmt_money(cp["value"])
+        text += (f"🏷️ <b>{esc(cp['code'])}</b> | {cp['type']} | {val}\n"
+                 f"   Used: {cp['used_count']}/{cp['usage_limit']} | Exp: {exp}\n\n")
+        rows.append([btn(f"🗑️ Delete {cp['code']}", f"del_coupon:{cp['id']}", "danger")])
+    rows.append([btn("➕ Add Coupon", "admin_add_coupon", "success")])
+    rows.append([btn("⬅️ Back", "back:admin", "primary")])
+    await edit(query, text, kb(rows))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MESSAGE HANDLER (text input states)
+# ═══════════════════════════════════════════════════════════════════
+
+ADMIN_STATES = {"await_prod_name", "await_prod_group", "await_prod_plans", "await_prod_desc",
+                "await_coupon_code", "await_broadcast", "await_admin_user_id", "await_admin_amount",
+                "await_search", "await_plan_price", "await_welcome", "await_new_plan",
+                "await_prod_vip", "await_prod_demo", "await_prod_field", "await_plan_name",
+                "await_setting", "await_media"}
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg = update.effective_user
+    uid = tg.id
+    if not is_admin(uid) and flooded(uid, 0.6):
+        return
+    user = ensure_user(tg)
+    blocked = gate_text(user, uid)
+    if blocked:
+        await update.message.reply_text(blocked)
+        return
+
+    msg = update.message
+    text = (msg.text or "").strip()
+    state = context.user_data.get("state")
+
+    if state in ADMIN_STATES and not is_admin(uid):
+        context.user_data.clear()
+        return
+
+    # ─── wallet ───
+    if state == "await_amount":
+        try:
+            amount = round(float(text), 2)
+        except ValueError:
+            await msg.reply_text("❌ Please enter a valid number.")
+            return
+        if amount < MIN_RECHARGE or amount > MAX_RECHARGE:
+            await msg.reply_text(f"❌ Amount must be between {fmt_money(MIN_RECHARGE)} and {fmt_money(MAX_RECHARGE)}.")
+            return
+        context.user_data.pop("state", None)
+        await send_payment_details(context, msg.chat_id, amount, user)
+
+    elif state == "await_utr":
+        tx_id = context.user_data.get("utr_tx_id")
+        utr = text.replace(" ", "")
+        if not (utr.isdigit() and len(utr) == 12):
+            await msg.reply_text("❌ UTR must be exactly <b>12 digits</b>. Please send it again:", parse_mode="HTML")
+            return
+        context.user_data.clear()
+        await verify_by_utr(context, msg, user, tx_id, utr)
+
+    # ─── v1 android id ───
+    elif state == "await_android_id":
+        pending = context.user_data.get("pending_purchase")
+        if not pending:
+            await msg.reply_text("❌ Session expired.", reply_markup=main_menu(uid))
+            return
+        product = db.get_product(pending["product_id"])
+        plan = db.get_plan(pending["plan_id"])
+        if not product or not plan:
+            await msg.reply_text("❌ Product not available.", reply_markup=main_menu(uid))
+            return
+        android_id = text[:64]
+        context.user_data.pop("state", None)
+        context.user_data.pop("pending_purchase", None)
+        context.user_data["android_id"] = android_id
+        price, discount, code = price_with_coupon(user, float(plan["price"]))
+        await msg.reply_text(
+            order_summary(product, plan, price, discount, code, float(user["balance"]), android_id),
+            reply_markup=kb([[btn("✅ Confirm", f"confirm_buy:{product['id']}:{plan['id']}", "success")],
+                             cancel_row()]),
+            parse_mode="HTML")
+
+    # ─── coupon redeem ───
+    elif state == "await_coupon":
+        context.user_data.pop("state", None)
+        status, c = db.redeem_coupon(text, user["id"])
+        if status == "invalid":
+            await msg.reply_text("❌ Invalid or expired coupon.", reply_markup=main_menu(uid))
+        elif status == "used":
+            await msg.reply_text("❌ You have already used this coupon.", reply_markup=main_menu(uid))
+        elif status == "limit":
+            await msg.reply_text("❌ This coupon has reached its usage limit.", reply_markup=main_menu(uid))
+        elif c["type"] == "BALANCE":
+            db.update_balance(uid, float(c["value"]))
+            await msg.reply_text(f"🎁 <b>Coupon Redeemed!</b>\n\n💰 {fmt_money(c['value'])} added to your wallet!",
+                                 reply_markup=main_menu(uid), parse_mode="HTML")
+        else:
+            db.set_active_coupon(uid, c["code"])
+            val = f"{c['value']:g}%" if c["type"] == "PERCENT" else fmt_money(c["value"])
+            await msg.reply_text(
+                f"🎁 Coupon <b>{esc(c['code'])}</b> activated!\n\n🏷️ <b>{val} OFF</b> will be applied on your "
+                f"next purchase automatically.", reply_markup=main_menu(uid), parse_mode="HTML")
+
+    # ─── admin: add product ───
+    elif state == "await_prod_name":
+        context.user_data["prod_name"] = text[:60]
+        context.user_data["state"] = "await_prod_plans"
+        await msg.reply_text(
+            f"<b>Step 2/5:</b> Send the plans for <b>{esc(text[:60])}</b>\n\n"
+            f"One per line, format <code>Name = Price</code>\n"
+            f"<code>7 Days = 100</code>\n<code>30 Days = 300</code>\n<code>Lifetime = 999</code>\n\n"
+            f"The plan name sets how long the VIP stays (Hours / Days / Weeks / Months / Lifetime).",
+            reply_markup=kb([cancel_row()]), parse_mode="HTML")
+
+    elif state == "await_prod_plans":
+        plans = []
+        errors = []
+        for line in text.split("\n"):
+            if "=" not in line:
+                continue
+            name, price = line.split("=", 1)
+            name = name.strip()
+            try:
+                price_v = float(price.strip())
+                if price_v <= 0:
+                    raise ValueError
+            except ValueError:
+                errors.append(line)
+                continue
+            hours = guess_hours(name)
+            if hours is None:
+                errors.append(f"{line}  (no duration in name, e.g. 30 Days / 1 Month / Lifetime)")
+                continue
+            plans.append((name, price_v, hours))
+        if errors or not plans:
+            await msg.reply_text("❌ Fix these lines and send again:\n" +
+                                 "\n".join(esc(e) for e in (errors or ["No valid plans found."])) +
+                                 "\n\nFormat: Name = Price  (e.g. 2 Days = 500)")
+            return
+        context.user_data["prod_plans"] = plans
+        context.user_data["state"] = "await_prod_desc"
+        await msg.reply_text("<b>Step 3/5:</b> Send the product description (or <code>-</code> to skip):",
+                             reply_markup=kb([cancel_row()]), parse_mode="HTML")
+
+    elif state == "await_prod_desc":
+        context.user_data["prod_desc"] = "" if text == "-" else text[:900]
+        context.user_data["state"] = "await_prod_vip"
+        await msg.reply_text(
+            "<b>Step 4/5:</b> Send the <b>VIP channel link</b> that buyers get after payment\n"
+            "(e.g. <code>https://t.me/+AbCdEf...</code>)\n\nSend <code>-</code> to skip (you can set it later).",
+            reply_markup=kb([cancel_row()]), parse_mode="HTML")
+
+    elif state == "await_prod_vip":
+        link = None
+        if text != "-":
+            link = norm_link(text)
+            if not link:
+                await msg.reply_text("❌ Send a valid link (https://t.me/...) or <code>-</code> to skip.",
+                                     parse_mode="HTML")
+                return
+        context.user_data["prod_vip"] = link
+        context.user_data["state"] = "await_prod_demo"
+        await msg.reply_text("<b>Step 5/5:</b> Send the <b>demo channel link</b> (or <code>-</code> to skip):",
+                             reply_markup=kb([cancel_row()]), parse_mode="HTML")
+
+    elif state == "await_prod_demo":
+        demo = None
+        if text != "-":
+            demo = norm_link(text)
+            if not demo:
+                await msg.reply_text("❌ Send a valid link (https://t.me/...) or <code>-</code> to skip.",
+                                     parse_mode="HTML")
+                return
+        data = context.user_data
+        name = data["prod_name"]
+        pid = db.create_product(name, "Main", data.get("prod_desc", ""), use_api=0,
+                                vip_link=data.get("prod_vip"), demo_link=demo)
+        for plan_name, price, hours in data["prod_plans"]:
+            db.add_product_plan(pid, plan_name, price, hours)
+        db.log_admin(uid, f"created product {pid} {name}")
+        context.user_data.clear()
+        await msg.reply_text(f"✅ Product <b>{esc(name)}</b> created - it is now on the main page!\n\n"
+                             f"Add photos/videos, demo media or button titles below 👇", parse_mode="HTML")
+        view_text, view_markup = edit_product_view(pid)
+        await msg.reply_text(view_text, reply_markup=view_markup, parse_mode="HTML")
+
+    elif state == "await_plan_price":
+        try:
+            price = round(float(text), 2)
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            await msg.reply_text("❌ Send a valid price (number greater than 0).")
+            return
+        plan_id = context.user_data.get("edit_plan_id")
+        db.update_plan_price(plan_id, price)
+        db.log_admin(uid, f"plan {plan_id} price -> {price}")
+        context.user_data.clear()
+        await msg.reply_text(f"✅ Price updated to <b>{fmt_money(price)}</b>.", parse_mode="HTML")
+        plan = db.get_plan(plan_id)
+        if plan:
+            view_text, view_markup = edit_product_view(plan["product_id"])
+            await msg.reply_text(view_text, reply_markup=view_markup, parse_mode="HTML")
+
+    # ─── admin: coupon ───
+    elif state == "await_coupon_code":
+        context.user_data.pop("state", None)
+        try:
+            parts = text.split()
+            if len(parts) < 3:
+                raise ValueError("Invalid format")
+            code, type_, value = parts[0].upper(), parts[1].upper(), float(parts[2])
+            if type_ not in ("BALANCE", "PERCENT", "FLAT"):
+                raise ValueError("TYPE must be BALANCE, PERCENT or FLAT")
+            if type_ == "PERCENT" and not 0 < value <= 90:
+                raise ValueError("PERCENT must be between 1 and 90")
+            days = int(parts[3]) if len(parts) > 3 else 30
+            limit = int(parts[4]) if len(parts) > 4 else 1
+            db.create_coupon(code, type_, value, days or None, limit)
+            db.log_admin(uid, f"created coupon {code}")
+            await msg.reply_text(f"✅ Coupon <b>{esc(code)}</b> created!",
+                                 reply_markup=main_menu(uid), parse_mode="HTML")
+        except sqlite3.IntegrityError:
+            await msg.reply_text("❌ That coupon code already exists.", reply_markup=main_menu(uid))
+        except Exception as e:
+            await msg.reply_text(f"❌ {esc(str(e))}\nFormat: CODE TYPE VALUE DAYS LIMIT",
+                                 reply_markup=main_menu(uid))
+
+    # ─── admin: broadcast ───
+    elif state == "await_broadcast":
+        context.user_data.pop("state", None)
+        body = msg.text_html or text
+        sent = failed = 0
+        await msg.reply_text("📢 Broadcasting... Please wait.")
+        for u in db.get_all_users(limit=100000):
+            if u["banned"]:
+                continue
+            try:
+                await context.bot.send_message(
+                    u["telegram_id"], RAW + f"📢 <b>Announcement from {esc(STORE_NAME)}</b>\n{DIV}\n{body}",
+                    parse_mode="HTML")
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+        db.log_admin(uid, f"broadcast sent={sent} failed={failed}")
+        await msg.reply_text(f"✅ Broadcast complete!\nSent: {sent}\nFailed: {failed}", reply_markup=main_menu(uid))
+
+    # ─── admin: search / ban ───
+    elif state == "await_search":
+        context.user_data.pop("state", None)
+        u = db.find_user(text)
+        if not u:
+            await msg.reply_text("❌ User not found.", reply_markup=main_menu(uid))
+            return
+        await msg.reply_text(
+            user_card(u),
+            reply_markup=kb([[btn("✅ Unban" if u["banned"] else "🚫 Ban", f"ban_toggle:{u['telegram_id']}",
+                                  "success" if u["banned"] else "danger")],
+                             [btn("⬅️ Back", "back:admin")]]),
+            parse_mode="HTML")
+
+    # ─── admin: add balance ───
+    elif state == "await_admin_user_id":
+        try:
+            target = int(text)
+        except ValueError:
+            await msg.reply_text("❌ Please enter a valid numeric User ID.")
+            return
+        if not db.get_user(target):
+            await msg.reply_text("❌ User not found (they must have started the bot).")
+            return
+        context.user_data["target_user_id"] = target
+        context.user_data["state"] = "await_admin_amount"
+        verb = "deduct" if context.user_data.get("bal_mode") == "deduct" else "add"
+        await msg.reply_text(f"Enter amount to {verb}:", reply_markup=kb([cancel_row()]))
+
+    elif state == "await_admin_amount":
+        try:
+            amount = abs(round(float(text), 2))
+            if amount == 0:
+                raise ValueError
+        except ValueError:
+            await msg.reply_text("❌ Please enter a valid amount.")
+            return
+        target = context.user_data.get("target_user_id")
+        deduct = context.user_data.get("bal_mode") == "deduct"
+        if deduct:
+            target_user = db.get_user(target)
+            amount = min(amount, float(target_user["balance"])) if target_user else 0
+            if amount <= 0:
+                context.user_data.clear()
+                await msg.reply_text("❌ User has no balance to deduct.", reply_markup=main_menu(uid))
+                return
+            db.update_balance(target, -amount)
+            db.log_admin(uid, f"deducted {amount} from {target}")
+        else:
+            db.update_balance(target, amount)
+            db.log_admin(uid, f"added {amount} to {target}")
+        context.user_data.clear()
+        await msg.reply_text(
+            f"✅ {'Deducted' if deduct else 'Added'} {fmt_money(amount)} "
+            f"{'from' if deduct else 'to'} <code>{target}</code>",
+            reply_markup=main_menu(uid), parse_mode="HTML")
+        try:
+            if deduct:
+                await context.bot.send_message(
+                    target, f"⚠️ <b>Balance Adjusted</b>\n\n💰 {fmt_money(amount)} was deducted from your wallet by admin.",
+                    parse_mode="HTML")
+            else:
+                await context.bot.send_message(
+                    target, f"🎉 <b>Balance Added!</b>\n\n💰 {fmt_money(amount)} was added to your wallet.",
+                    parse_mode="HTML")
+        except Exception:
+            pass
+
+    # ─── admin: welcome message ───
+    elif state == "await_welcome":
+        context.user_data.clear()
+        if text == "-":
+            db.set_setting("welcome_msg", None)
+            db.log_admin(uid, "reset welcome message")
+            await msg.reply_text("✅ Welcome message reset to default.", reply_markup=main_menu(uid))
+        else:
+            db.set_setting("welcome_msg", msg.text_html or esc(text))
+            db.log_admin(uid, "updated welcome message")
+            await msg.reply_text("✅ Welcome message updated!\n\nUse /start to preview it.",
+                                 reply_markup=main_menu(uid))
+
+    # ─── admin: edit one product field (name, description, VIP link/title, demo link/title) ───
+    elif state == "await_prod_field":
+        pid = context.user_data.get("prod_edit_id")
+        field = context.user_data.get("prod_edit_field")
+        spec = PROD_FIELDS.get(field)
+        if not spec or not pid or not db.get_product(pid):
+            context.user_data.clear()
+            await msg.reply_text("❌ Product not found.", reply_markup=main_menu(uid))
+            return
+        label, col, optional = spec
+        if text == "-" and optional:
+            value = None
+        elif text == "-":
+            await msg.reply_text("❌ The name cannot be empty. Send the new name:")
+            return
+        elif field in LINK_FIELDS:
+            value = norm_link(text)
+            if not value:
+                await msg.reply_text("❌ Send a valid link (https://t.me/...) or <code>-</code> to remove it.",
+                                     parse_mode="HTML")
+                return
+        elif field == "name":
+            value = text[:60]
+        elif field in ("vip_title", "demo_title"):
+            value = text[:40]
+        else:
+            value = text[:900]
+        db.update_product_field(pid, col, value)
+        db.log_admin(uid, f"product {pid} {col} updated")
+        context.user_data.clear()
+        await msg.reply_text(f"✅ {label} updated.")
+        view_text, view_markup = edit_product_view(pid)
+        await msg.reply_text(view_text, reply_markup=view_markup, parse_mode="HTML")
+
+    # ─── admin: rename a plan / change its duration ───
+    elif state == "await_plan_name":
+        plan_id = context.user_data.get("plan_edit_id")
+        plan = db.get_plan(plan_id) if plan_id else None
+        if not plan:
+            context.user_data.clear()
+            await msg.reply_text("❌ Plan not found.", reply_markup=main_menu(uid))
+            return
+        hours = guess_hours(text)
+        if hours is None:
+            await msg.reply_text("❌ The name must contain a duration, e.g. <code>30 Days</code>, "
+                                 "<code>1 Month</code> or <code>Lifetime</code>.", parse_mode="HTML")
+            return
+        db.update_plan_name(plan_id, text[:40], hours)
+        db.log_admin(uid, f"plan {plan_id} renamed to {text[:40]}")
+        context.user_data.clear()
+        await msg.reply_text(f"✅ Plan updated: <b>{esc(text[:40])}</b> ({fmt_duration(hours)}).", parse_mode="HTML")
+        view_text, view_markup = edit_product_view(plan["product_id"])
+        await msg.reply_text(view_text, reply_markup=view_markup, parse_mode="HTML")
+
+    # ─── admin: bot settings (UPI ID, store name, support, limits) ───
+    elif state == "await_setting":
+        key = context.user_data.get("setting_key")
+        if key not in SETTING_DEFS:
+            context.user_data.clear()
+            return
+        label, kind, _var = SETTING_DEFS[key]
+        if text == "-":
+            value = None
+        else:
+            value, err = validate_setting(kind, text, key)
+            if err:
+                await msg.reply_text(err, parse_mode="HTML")
+                return
+        db.set_setting(key, value)
+        apply_settings()
+        db.log_admin(uid, f"setting {key} -> {value if value is not None else 'default'}")
+        context.user_data.clear()
+        await msg.reply_text(f"✅ {label} updated.")
+        if key == "upi_id":
+            await notify_admins(context.bot, f"⚠️ <b>UPI ID changed</b>\n\nBy admin: <code>{uid}</code>\n"
+                                             f"New UPI ID: <code>{esc(UPI_ID)}</code>")
+        view_text, view_markup = settings_view()
+        await msg.reply_text(view_text, reply_markup=view_markup, parse_mode="HTML")
+
+    # ─── admin: add plan to existing product ───
+    elif state == "await_new_plan":
+        pid = context.user_data.get("plan_product_id")
+        if "=" not in text:
+            await msg.reply_text("❌ Format: <code>Name = Price</code>  (e.g. <code>2 Days = 500</code>)")
+            return
+        name, price_s = text.split("=", 1)
+        name = name.strip()
+        hours = guess_hours(name)
+        try:
+            price = round(float(price_s.strip()), 2)
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            await msg.reply_text("❌ Send a valid price.")
+            return
+        if hours is None:
+            await msg.reply_text("❌ Plan name must contain a duration (e.g. <code>2 Days</code>, "
+                                 "<code>1 Month</code> or <code>Lifetime</code>).")
+            return
+        db.add_product_plan(pid, name, price, hours)
+        db.log_admin(uid, f"added plan {name} = {price} to product {pid}")
+        context.user_data.clear()
+        await msg.reply_text(f"✅ Plan <b>{esc(name)}</b> added at {fmt_money(price)}.")
+        view_text, view_markup = edit_product_view(pid)
+        await msg.reply_text(view_text, reply_markup=view_markup, parse_mode="HTML")
+
+    else:
+        await msg.reply_text(welcome_text(user), reply_markup=main_menu(uid), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PHOTO / VIDEO UPLOAD  (welcome screen, product media, demo media)
+# ═══════════════════════════════════════════════════════════════════
+
+async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sends photos/videos while adding media. Everyone else is ignored."""
+    msg = update.message
+    uid = update.effective_user.id
+    if not msg or not is_admin(uid) or context.user_data.get("state") != "await_media":
+        return
+    owner = context.user_data.get("media_owner")
+    if not owner:
+        return
+    if msg.photo:
+        file_id, mtype = msg.photo[-1].file_id, "photo"
+    elif msg.video:
+        file_id, mtype = msg.video.file_id, "video"
+    else:
+        return
+    full = db.count_media(owner) >= MAX_MEDIA_PER_ITEM
+    if not full:
+        db.add_media(owner, file_id, mtype)
+    gid = msg.media_group_id
+    if gid and context.user_data.get("media_group") == gid:
+        return  # one reply per album, not one per photo
+    context.user_data["media_group"] = gid
+    head_line = f"❌ Maximum {MAX_MEDIA_PER_ITEM} files reached." if full else "✅ Added!"
+    await msg.reply_text(f"{head_line}\n\nSend more, or tap <b>Done</b>.",
+                         reply_markup=kb([[btn("✅ Done", f"admin_mm:{owner}", "success")]]), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PAYMENT ENGINE  (UTR verification + UTR registry)
+# ═══════════════════════════════════════════════════════════════════
+
+_utr_fails: Dict[int, List[float]] = {}
+
+
+def utr_blocked(uid: int) -> bool:
+    """Max 5 failed UTR checks per 10 minutes (stops guessing)."""
+    now = time.time()
+    recent = [t for t in _utr_fails.get(uid, []) if now - t < 600]
+    _utr_fails[uid] = recent
+    return len(recent) >= 5
+
+
+async def drop_qr_message(bot, tx: Dict):
+    if tx.get("chat_id") and tx.get("message_id"):
+        try:
+            await bot.delete_message(tx["chat_id"], tx["message_id"])
+        except Exception:
+            pass
+
+
+async def finalize_payment(bot, tx: Dict, utr: Optional[str]) -> str:
+    """Registers the UTR + credits the wallet (once) and notifies user and admins."""
+    res = db.credit_payment(tx["id"], utr)
+    u = db.get_user_by_id(tx["user_id"])
+    if not u:
+        return res
+    tg = u["telegram_id"]
+    if res == "ok":
+        await drop_qr_message(bot, tx)
+        try:
+            await bot.send_message(
+                tg, f"✅ <b>PAYMENT VERIFIED</b>\n\n💰 {fmt_money(tx['amount'])} added to your wallet!\n"
+                    f"🔢 UTR: <code>{esc(utr or 'N/A')}</code>\n\nThank you for choosing <b>{esc(STORE_NAME)}</b>.",
+                reply_markup=main_menu(tg), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed to notify user {tg}: {e}")
+        db.log_admin(0, f"auto-credited tx {tx['id']} ({tx['amount']}) to {tg} utr={utr}")
+        await notify_admins(
+            bot, f"💳 <b>AUTO PAYMENT</b> #{tx['id']}\n\n👤 {uname(u)}\n🆔 <code>{tg}</code>\n"
+                 f"💰 <b>{fmt_money(tx['amount'])}</b>\n🔢 UTR: <code>{esc(utr or 'N/A')}</code>")
+    elif res == "duplicate":
+        await drop_qr_message(bot, tx)
+        try:
+            await bot.send_message(
+                tg, f"⚠️ This UTR was already used for another payment, so it was not credited.\n"
+                    f"Contact {esc(SUPPORT_USERNAME)} if you think this is a mistake.",
+                reply_markup=main_menu(tg), parse_mode="HTML")
+        except Exception:
+            pass
+        await notify_admins(bot, f"⚠️ <b>DUPLICATE UTR</b> blocked\n\n👤 {uname(u)} (<code>{tg}</code>)\n"
+                                 f"🔢 <code>{esc(utr or '')}</code>  tx #{tx['id']}")
+    return res
+
+
+async def verify_by_utr(context, msg, user: Dict, tx_id: Optional[int], utr: str):
+    """User sends a UTR -> gateway verifies UTR + amount -> wallet is credited once."""
+    uid = user["telegram_id"]
+    back = main_menu(uid)
+    tx = db.get_transaction(tx_id) if tx_id else None
+    if not tx or tx["user_id"] != user["id"]:
+        await msg.reply_text("❌ Payment session not found. Please start Add Balance again.", reply_markup=back)
+        return
+    if tx["status"] == "approved":
+        await msg.reply_text("✅ This payment was already credited to your wallet.", reply_markup=back)
+        return
+    if tx["status"] not in ("pending", "expired"):
+        await msg.reply_text("❌ This payment session is closed. Please start Add Balance again.", reply_markup=back)
+        return
+    if utr_blocked(uid):
+        await msg.reply_text("⚠️ Too many wrong attempts. Please wait 10 minutes and try again.", reply_markup=back)
+        return
+    if db.utr_registered(utr):
+        _utr_fails.setdefault(uid, []).append(time.time())
+        await msg.reply_text("❌ This UTR has already been used.", reply_markup=back)
+        return
+
+    wait = await msg.reply_text("🔎 Verifying your payment... (can take up to a minute)")
+    try:
+        r = await asyncio.to_thread(fmpay_verify, utr, float(tx["amount"]))
+    except Exception as e:
+        logger.error(f"FMPay verify error: {e}")
+        await notify_admins(context.bot, f"⚠️ <b>Payment API error</b>\n<code>{esc(str(e))[:300]}</code>")
+        await msg.reply_text("⚠️ Verification service is not available right now. Please try again in a minute.",
+                             reply_markup=back)
+        return
+    finally:
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+
+    if not r["ok"]:
+        _utr_fails.setdefault(uid, []).append(time.time())
+        reason = f"\n\nReason: {esc(r['message'])[:150]}" if r.get("message") else ""
+        await msg.reply_text(
+            f"❌ <b>Payment not verified</b>\n\nWe could not find a payment of {fmt_money(tx['amount'])} "
+            f"with this UTR.{reason}\n\nCheck the UTR and the exact amount, then try again, or contact "
+            f"{esc(SUPPORT_USERNAME)}.",
+            reply_markup=kb([[btn("🔢 Try Again", f"utr_verify:{tx['id']}", "primary")],
+                             [btn("⬅️ Main Menu", "back:main")]]),
+            parse_mode="HTML")
+        return
+    res = await finalize_payment(context.bot, tx, utr)
+    if res == "done":
+        await msg.reply_text("✅ This payment was already credited to your wallet.", reply_markup=back)
+    elif res == "invalid":
+        await msg.reply_text(f"❌ This payment can't be credited. Contact {esc(SUPPORT_USERNAME)}.",
+                             reply_markup=back, parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BACKGROUND JOBS / ERRORS / MAIN
+# ═══════════════════════════════════════════════════════════════════
+
+async def expire_job(context: ContextTypes.DEFAULT_TYPE):
+    n = db.expire_stale(PAYMENT_EXPIRY_MIN)
+    if n:
+        logger.info(f"Expired {n} unfinished payment(s)")
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error", exc_info=context.error)
+
+
+def main():
+    apply_settings()   # UPI ID / store name / etc. changed from the admin panel
+    if not BOT_TOKEN:
+        sys.exit("BOT_TOKEN missing. Paste it in BOT_TOKEN_VALUE at the top of storebot.py (or .env).")
+    if not ADMIN_IDS:
+        sys.exit("ADMIN ID missing. Set ADMIN_ID_VALUE at the top of storebot.py (or ADMIN_IDS in .env).")
+    if not FMPAY_API_KEY:
+        sys.exit("FMPay API key missing. Set FMPAY_API_KEY_VALUE at the top of storebot.py.")
+    if not UPI_ID:
+        sys.exit("UPI ID missing. Set UPI_ID_VALUE at the top of storebot.py.")
+    if not API_HEADERS["X-API-Key"] or not API_HEADERS["M-Key"]:
+        logger.warning("API_KEY / API_MKEY missing in .env - key delivery will fail!")
+
+    bot = BoldBot(token=BOT_TOKEN, defaults=Defaults(parse_mode="HTML"))
+    app = Application.builder().bot(bot).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, media_handler))
+    app.add_error_handler(error_handler)
+
+    if app.job_queue:
+        app.job_queue.run_repeating(expire_job, interval=300, first=60)
+    else:
+        logger.warning("job-queue not installed: pip install 'python-telegram-bot[job-queue]'")
+
+    logger.info(f"🚀 {STORE_NAME} Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
